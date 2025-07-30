@@ -10,6 +10,9 @@ const ffmpeg = require('fluent-ffmpeg');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Disable ytdl update check
+process.env.YTDL_NO_UPDATE = '1';
+
 // Middleware
 app.use(express.json());
 app.use(cors({
@@ -40,6 +43,41 @@ const createDirectories = async () => {
 // Storage for download progress and completed downloads
 const downloadsInProgress = new Map();
 const completedDownloads = new Map();
+
+// Rate limiting variables
+const requestCount = new Map();
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const MAX_REQUESTS_PER_WINDOW = 10;
+
+// Rate limiting middleware
+const rateLimiter = (req, res, next) => {
+  const clientIP = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  
+  if (!requestCount.has(clientIP)) {
+    requestCount.set(clientIP, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return next();
+  }
+  
+  const clientData = requestCount.get(clientIP);
+  
+  if (now > clientData.resetTime) {
+    // Reset the count
+    clientData.count = 1;
+    clientData.resetTime = now + RATE_LIMIT_WINDOW;
+    return next();
+  }
+  
+  if (clientData.count >= MAX_REQUESTS_PER_WINDOW) {
+    return res.status(429).json({
+      error: 'Too many requests. Please wait before making another request.',
+      retryAfter: Math.ceil((clientData.resetTime - now) / 1000)
+    });
+  }
+  
+  clientData.count++;
+  next();
+};
 
 // Cleanup function
 const cleanupOldFiles = async () => {
@@ -74,6 +112,13 @@ const cleanupOldFiles = async () => {
         completedDownloads.delete(id);
       }
     }
+
+    // Clean rate limiter data
+    for (const [ip, data] of requestCount.entries()) {
+      if (now > data.resetTime) {
+        requestCount.delete(ip);
+      }
+    }
   } catch (error) {
     console.error('Cleanup error:', error);
   }
@@ -82,80 +127,160 @@ const cleanupOldFiles = async () => {
 // Run cleanup every hour
 setInterval(cleanupOldFiles, 60 * 60 * 1000);
 
-// Create agent with better headers to avoid detection
-const agent = ytdl.createAgent([
-  {
-    "name": "VISITOR_INFO1_LIVE",
-    "value": "st1td6w_9rslsToken"
-  }
-], {
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  }
-});
-
-// Helper function to get video info
-const getVideoInfo = async (url) => {
+// Enhanced agent configuration with better headers and cookies
+const createAgent = async () => {
+  let cookies = [];
+  
+  // Try to load cookies from file if it exists
   try {
-    const info = await ytdl.getInfo(url, { agent });
-    const videoDetails = info.videoDetails;
-    const formats = info.formats;
-
-    // Filter and map audio formats
-    const audioFormats = formats
-      .filter(format => format.hasAudio && !format.hasVideo && format.audioBitrate)
-      .map(format => ({
-        format_id: format.itag.toString(),
-        ext: format.container,
-        format_note: `${format.audioBitrate}kbps`,
-        abr: format.audioBitrate,
-        filesize: format.contentLength ? parseInt(format.contentLength) : null,
-        download_url: `/api/direct-download/${videoDetails.videoId}/${format.itag}`
-      }))
-      .sort((a, b) => (b.abr || 0) - (a.abr || 0));
-
-    // Filter and map video formats
-    const videoFormats = formats
-      .filter(format => format.hasVideo && format.height)
-      .map(format => ({
-        format_id: format.itag.toString(),
-        ext: format.container,
-        format_note: format.qualityLabel || `${format.height}p`,
-        width: format.width,
-        height: format.height,
-        fps: format.fps,
-        vcodec: format.videoCodec,
-        acodec: format.hasAudio ? format.audioCodec : 'none',
-        filesize: format.contentLength ? parseInt(format.contentLength) : null,
-        download_url: `/api/direct-download/${videoDetails.videoId}/${format.itag}`,
-        resolution: `${format.width}x${format.height}`
-      }))
-      .sort((a, b) => (b.height || 0) - (a.height || 0));
-
-    return {
-      id: videoDetails.videoId,
-      title: videoDetails.title,
-      description: videoDetails.description,
-      duration: parseInt(videoDetails.lengthSeconds),
-      view_count: parseInt(videoDetails.viewCount),
-      upload_date: videoDetails.uploadDate,
-      thumbnails: videoDetails.thumbnails.map(thumb => ({
-        url: thumb.url,
-        width: thumb.width,
-        height: thumb.height
-      })),
-      channel: {
-        id: videoDetails.channelId,
-        name: videoDetails.author,
-        url: `https://www.youtube.com/channel/${videoDetails.channelId}`,
-        verified: videoDetails.author?.verified || false
-      },
-      audio_formats: audioFormats,
-      video_formats: videoFormats
-    };
+    const cookieData = await fs.readFile(COOKIE_FILE, 'utf8');
+    // Parse cookie file (Netscape format)
+    const lines = cookieData.split('\n');
+    for (const line of lines) {
+      if (line.trim() && !line.startsWith('#')) {
+        const parts = line.split('\t');
+        if (parts.length >= 7) {
+          cookies.push({
+            name: parts[5],
+            value: parts[6],
+            domain: parts[0]
+          });
+        }
+      }
+    }
+    console.log(`Loaded ${cookies.length} cookies from file`);
   } catch (error) {
-    console.error('Video info error:', error);
-    throw new Error(`Failed to get video info: ${error.message}`);
+    console.log('No cookie file found, using default cookies');
+    // Use some default cookies that might help
+    cookies = [
+      {
+        "name": "VISITOR_INFO1_LIVE",
+        "value": "st1td6w_9rslsToken",
+        "domain": ".youtube.com"
+      },
+      {
+        "name": "CONSENT",
+        "value": "PENDING+987",
+        "domain": ".youtube.com"
+      }
+    ];
+  }
+
+  return ytdl.createAgent(cookies, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'DNT': '1',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Cache-Control': 'max-age=0'
+    }
+  });
+};
+
+// Initialize agent
+let agent;
+createAgent().then(a => agent = a).catch(console.error);
+
+// Helper function to get video info with retry logic
+const getVideoInfo = async (url, retries = 3) => {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      // Recreate agent if needed
+      if (!agent) {
+        agent = await createAgent();
+      }
+
+      const info = await ytdl.getInfo(url, { 
+        agent,
+        requestOptions: {
+          timeout: 30000, // 30 second timeout
+        }
+      });
+      
+      const videoDetails = info.videoDetails;
+      const formats = info.formats;
+
+      // Filter and map audio formats
+      const audioFormats = formats
+        .filter(format => format.hasAudio && !format.hasVideo && format.audioBitrate)
+        .map(format => ({
+          format_id: format.itag.toString(),
+          ext: format.container,
+          format_note: `${format.audioBitrate}kbps`,
+          abr: format.audioBitrate,
+          filesize: format.contentLength ? parseInt(format.contentLength) : null,
+          download_url: `/api/direct-download/${videoDetails.videoId}/${format.itag}`
+        }))
+        .sort((a, b) => (b.abr || 0) - (a.abr || 0));
+
+      // Filter and map video formats
+      const videoFormats = formats
+        .filter(format => format.hasVideo && format.height)
+        .map(format => ({
+          format_id: format.itag.toString(),
+          ext: format.container,
+          format_note: format.qualityLabel || `${format.height}p`,
+          width: format.width,
+          height: format.height,
+          fps: format.fps,
+          vcodec: format.videoCodec,
+          acodec: format.hasAudio ? format.audioCodec : 'none',
+          filesize: format.contentLength ? parseInt(format.contentLength) : null,
+          download_url: `/api/direct-download/${videoDetails.videoId}/${format.itag}`,
+          resolution: `${format.width}x${format.height}`
+        }))
+        .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+      return {
+        id: videoDetails.videoId,
+        title: videoDetails.title,
+        description: videoDetails.description,
+        duration: parseInt(videoDetails.lengthSeconds),
+        view_count: parseInt(videoDetails.viewCount),
+        upload_date: videoDetails.uploadDate,
+        thumbnails: videoDetails.thumbnails.map(thumb => ({
+          url: thumb.url,
+          width: thumb.width,
+          height: thumb.height
+        })),
+        channel: {
+          id: videoDetails.channelId,
+          name: videoDetails.author,
+          url: `https://www.youtube.com/channel/${videoDetails.channelId}`,
+          verified: videoDetails.author?.verified || false
+        },
+        audio_formats: audioFormats,
+        video_formats: videoFormats
+      };
+    } catch (error) {
+      console.error(`Video info error (attempt ${attempt}):`, error);
+      
+      if (error.statusCode === 429) {
+        // Rate limited, wait before retry
+        const waitTime = attempt * 5000; // 5s, 10s, 15s
+        console.log(`Rate limited, waiting ${waitTime}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        
+        // Recreate agent for next attempt
+        agent = await createAgent();
+        continue;
+      }
+      
+      if (attempt === retries) {
+        throw new Error(`Failed to get video info after ${retries} attempts: ${error.message}`);
+      }
+      
+      // Wait before retry for other errors
+      await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+      agent = await createAgent();
+    }
   }
 };
 
@@ -167,17 +292,18 @@ app.get('/api/health', async (req, res) => {
     const cookieExists = await fs.access(COOKIE_FILE).then(() => true).catch(() => false);
     res.json({
       status: 'ok',
-      version: '2.0.0',
+      version: '2.1.0',
       cookieFileExists: cookieExists,
-      platform: 'nodejs'
+      platform: 'nodejs',
+      environment: process.env.NODE_ENV || 'development'
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get video information
-app.get('/api/video-info', async (req, res) => {
+// Get video information with rate limiting
+app.get('/api/video-info', rateLimiter, async (req, res) => {
   const { url } = req.query;
 
   if (!url) {
@@ -192,12 +318,24 @@ app.get('/api/video-info', async (req, res) => {
     const videoInfo = await getVideoInfo(url);
     res.json(videoInfo);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('API video info error:', error);
+    
+    if (error.message.includes('429') || error.message.includes('rate limit')) {
+      return res.status(429).json({ 
+        error: 'YouTube is rate limiting requests. Please try again later.',
+        retryAfter: 60
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Failed to fetch video information. Please try again later.',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
-// Start download
-app.get('/api/download', async (req, res) => {
+// Start download with rate limiting
+app.get('/api/download', rateLimiter, async (req, res) => {
   const { url, format_id } = req.query;
 
   if (!url) {
@@ -220,7 +358,7 @@ app.get('/api/download', async (req, res) => {
   });
 });
 
-// Process download function
+// Process download function with better error handling
 const processDownload = async (downloadId, url, formatId) => {
   downloadsInProgress.set(downloadId, {
     status: 'downloading',
@@ -230,6 +368,11 @@ const processDownload = async (downloadId, url, formatId) => {
   });
 
   try {
+    // Recreate agent if needed
+    if (!agent) {
+      agent = await createAgent();
+    }
+
     const info = await ytdl.getInfo(url, { agent });
     const videoDetails = info.videoDetails;
     const title = videoDetails.title.replace(/[^\w\s-]/g, '').trim();
@@ -452,8 +595,8 @@ app.get('/api/get-file/:downloadId', async (req, res) => {
   }
 });
 
-// Direct download endpoint with audio merging
-app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
+// Direct download endpoint with audio merging and rate limiting
+app.get('/api/direct-download/:videoId/:formatId', rateLimiter, async (req, res) => {
   const { videoId, formatId } = req.params;
   const { filename } = req.query;
   const url = `https://www.youtube.com/watch?v=${videoId}`;
@@ -461,6 +604,11 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
   try {
     if (!ytdl.validateURL(url)) {
       return res.status(400).json({ error: 'Invalid video ID' });
+    }
+
+    // Recreate agent if needed
+    if (!agent) {
+      agent = await createAgent();
     }
 
     const info = await ytdl.getInfo(url, { agent });
@@ -560,7 +708,14 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
   } catch (error) {
     console.error('Direct download error:', error);
     if (!res.headersSent) {
-      res.status(500).json({ error: error.message });
+      if (error.statusCode === 429 || error.message.includes('429')) {
+        res.status(429).json({ 
+          error: 'YouTube is rate limiting requests. Please try again later.',
+          retryAfter: 60 
+        });
+      } else {
+        res.status(500).json({ error: error.message });
+      }
     }
   }
 });
@@ -588,9 +743,13 @@ app.post('/api/upload-cookie', upload.single('cookie_file'), async (req, res) =>
   try {
     await fs.copyFile(req.file.path, COOKIE_FILE);
     await fs.unlink(req.file.path); // Clean up temp file
+    
+    // Recreate agent with new cookies
+    agent = await createAgent();
+    
     res.json({ 
       success: true, 
-      message: 'Cookie file uploaded successfully' 
+      message: 'Cookie file uploaded successfully. Agent updated with new cookies.' 
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -607,9 +766,18 @@ app.use((error, req, res, next) => {
 const startServer = async () => {
   await createDirectories();
   
+  // Initialize agent
+  try {
+    agent = await createAgent();
+    console.log('Agent initialized successfully');
+  } catch (error) {
+    console.error('Failed to initialize agent:', error);
+  }
+  
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`YouTube Downloader API running on port ${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/api/health`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   });
 };
 

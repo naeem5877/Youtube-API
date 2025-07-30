@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const https = require('https');
+const http = require('http');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
@@ -87,14 +88,79 @@ const cleanupOldFiles = async () => {
 // Run cleanup every hour
 setInterval(cleanupOldFiles, 60 * 60 * 1000);
 
-// Create HTTPS agent with proxy
+// Create proxy agent
 const createProxyAgent = () => {
   return new HttpsProxyAgent(PROXY_URL, {
-    rejectUnauthorized: false // Disable SSL verification as in your example
+    rejectUnauthorized: false
   });
 };
 
-// Create ytdl agent with proxy support
+// Custom request function that uses ScraperAPI proxy
+const makeProxyRequest = (url, options = {}) => {
+  return new Promise((resolve, reject) => {
+    const proxyAgent = createProxyAgent();
+    
+    const requestOptions = {
+      agent: proxyAgent,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        ...options.headers
+      },
+      timeout: 30000,
+      ...options
+    };
+
+    const request = https.request(url, requestOptions, (response) => {
+      let data = '';
+      
+      response.on('data', (chunk) => {
+        data += chunk;
+      });
+      
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          resolve({ data, statusCode: response.statusCode, headers: response.headers });
+        } else {
+          reject(new Error(`HTTP ${response.statusCode}: ${data}`));
+        }
+      });
+    });
+
+    request.on('error', reject);
+    request.on('timeout', () => {
+      request.destroy();
+      reject(new Error('Request timeout'));
+    });
+
+    if (options.body) {
+      request.write(options.body);
+    }
+    
+    request.end();
+  });
+};
+
+// Override ytdl's request function to use proxy
+const originalRequest = require('@distube/ytdl-core/lib/utils').request;
+require('@distube/ytdl-core/lib/utils').request = async (url, options = {}) => {
+  try {
+    console.log('Making proxied request to:', url);
+    const result = await makeProxyRequest(url, options);
+    return result.data;
+  } catch (error) {
+    console.error('Proxy request failed, falling back to original:', error.message);
+    // Fallback to original request if proxy fails
+    return originalRequest(url, options);
+  }
+};
+
+// Create ytdl agent with better headers
 const createYtdlAgent = () => {
   const proxyAgent = createProxyAgent();
   
@@ -106,7 +172,13 @@ const createYtdlAgent = () => {
   ], {
     agent: proxyAgent,
     headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate',
+      'DNT': '1',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1'
     }
   });
 };
@@ -114,8 +186,19 @@ const createYtdlAgent = () => {
 // Helper function to get video info with proxy
 const getVideoInfo = async (url) => {
   try {
+    // Add delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
     const agent = createYtdlAgent();
-    const info = await ytdl.getInfo(url, { agent });
+    const info = await ytdl.getInfo(url, { 
+      agent,
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      }
+    });
+    
     const videoDetails = info.videoDetails;
     const formats = info.formats;
 
@@ -182,10 +265,20 @@ const getVideoInfo = async (url) => {
 // Health check
 app.get('/api/health', async (req, res) => {
   try {
+    // Test proxy connection
+    let proxyWorking = false;
+    try {
+      await makeProxyRequest('https://www.youtube.com');
+      proxyWorking = true;
+    } catch (error) {
+      console.error('Proxy test failed:', error.message);
+    }
+
     res.json({
       status: 'ok',
       version: '2.0.0',
       proxyEnabled: !!SCRAPERAPI_KEY,
+      proxyWorking,
       platform: 'nodejs'
     });
   } catch (error) {
@@ -209,6 +302,7 @@ app.get('/api/video-info', async (req, res) => {
     const videoInfo = await getVideoInfo(url);
     res.json(videoInfo);
   } catch (error) {
+    console.error('Video info endpoint error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -247,8 +341,19 @@ const processDownload = async (downloadId, url, formatId) => {
   });
 
   try {
+    // Add delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
     const agent = createYtdlAgent();
-    const info = await ytdl.getInfo(url, { agent });
+    const info = await ytdl.getInfo(url, { 
+      agent,
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      }
+    });
+    
     const videoDetails = info.videoDetails;
     const title = videoDetails.title.replace(/[^\w\s-]/g, '').trim();
     const outputPath = path.join(DOWNLOAD_FOLDER, `${downloadId}_${title}.mp4`);
@@ -266,7 +371,15 @@ const processDownload = async (downloadId, url, formatId) => {
 
     // If video format has audio, just download it directly
     if (videoFormat.hasAudio) {
-      const stream = ytdl(url, { format: videoFormat, agent });
+      const stream = ytdl(url, { 
+        format: videoFormat, 
+        agent,
+        requestOptions: {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          }
+        }
+      });
       const writeStream = require('fs').createWriteStream(outputPath);
 
       let downloadedBytes = 0;
@@ -368,7 +481,15 @@ const processDownload = async (downloadId, url, formatId) => {
 // Helper function to download stream to file
 const downloadStream = (url, format, outputPath, downloadId, type, agent) => {
   return new Promise((resolve, reject) => {
-    const stream = ytdl(url, { format, agent });
+    const stream = ytdl(url, { 
+      format, 
+      agent,
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      }
+    });
     const writeStream = require('fs').createWriteStream(outputPath);
 
     let downloadedBytes = 0;
@@ -481,8 +602,19 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
       return res.status(400).json({ error: 'Invalid video ID' });
     }
 
+    // Add delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
     const agent = createYtdlAgent();
-    const info = await ytdl.getInfo(url, { agent });
+    const info = await ytdl.getInfo(url, { 
+      agent,
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      }
+    });
+    
     const videoDetails = info.videoDetails;
     const title = videoDetails.title.replace(/[^\w\s-]/g, '').trim();
     
@@ -502,7 +634,12 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
 
       const stream = ytdl(url, { 
         format: requestedFormat,
-        agent
+        agent,
+        requestOptions: {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          }
+        }
       });
 
       stream.on('error', (error) => {
@@ -518,7 +655,6 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
       const tempId = uuidv4();
       const videoPath = path.join(TEMP_FOLDER, `${tempId}_video.${requestedFormat.container}`);
       const audioPath = path.join(TEMP_FOLDER, `${tempId}_audio.webm`);
-      const outputPath = path.join(TEMP_FOLDER, `${tempId}_merged.mp4`);
 
       try {
         // Get best audio format
@@ -535,43 +671,40 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
         ]);
 
         // Merge and stream the result
-        await new Promise((resolve, reject) => {
-          res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
-          res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+        res.setHeader('Content-Type', 'video/mp4');
 
-          ffmpeg()
-            .input(videoPath)
-            .input(audioPath)
-            .outputOptions([
-              '-c:v copy',
-              '-c:a aac',
-              '-strict experimental',
-              '-movflags frag_keyframe+empty_moov' // Enable streaming
-            ])
-            .format('mp4')
-            .on('end', () => {
-              // Clean up temp files
-              fs.unlink(videoPath).catch(console.error);
-              fs.unlink(audioPath).catch(console.error);
-              fs.unlink(outputPath).catch(console.error);
-              resolve();
-            })
-            .on('error', (err) => {
-              console.error('FFmpeg error:', err);
-              // Clean up temp files
-              fs.unlink(videoPath).catch(console.error);
-              fs.unlink(audioPath).catch(console.error);
-              fs.unlink(outputPath).catch(console.error);
-              reject(err);
-            })
-            .pipe(res);
-        });
+        const ffmpegProcess = ffmpeg()
+          .input(videoPath)
+          .input(audioPath)
+          .outputOptions([
+            '-c:v copy',
+            '-c:a aac',
+            '-strict experimental',
+            '-movflags frag_keyframe+empty_moov'
+          ])
+          .format('mp4')
+          .on('end', () => {
+            // Clean up temp files
+            fs.unlink(videoPath).catch(console.error);
+            fs.unlink(audioPath).catch(console.error);
+          })
+          .on('error', (err) => {
+            console.error('FFmpeg error:', err);
+            // Clean up temp files
+            fs.unlink(videoPath).catch(console.error);
+            fs.unlink(audioPath).catch(console.error);
+            if (!res.headersSent) {
+              res.status(500).json({ error: 'Merge failed' });
+            }
+          });
+
+        ffmpegProcess.pipe(res);
 
       } catch (error) {
         // Clean up any temp files
         fs.unlink(videoPath).catch(console.error);
         fs.unlink(audioPath).catch(console.error);
-        fs.unlink(outputPath).catch(console.error);
         throw error;
       }
     }
@@ -587,7 +720,15 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
 // Helper function to download stream to file
 const downloadToFile = (url, format, outputPath, agent) => {
   return new Promise((resolve, reject) => {
-    const stream = ytdl(url, { format, agent });
+    const stream = ytdl(url, { 
+      format, 
+      agent,
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+      }
+    });
     const writeStream = require('fs').createWriteStream(outputPath);
 
     stream.on('error', reject);
@@ -603,6 +744,9 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// Set environment variable to disable ytdl update check
+process.env.YTDL_NO_UPDATE = '1';
+
 // Initialize directories and start server
 const startServer = async () => {
   await createDirectories();
@@ -611,6 +755,7 @@ const startServer = async () => {
     console.log(`YouTube Downloader API running on port ${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/api/health`);
     console.log(`Proxy enabled: ${!!SCRAPERAPI_KEY}`);
+    console.log(`YTDL_NO_UPDATE set to disable update checks`);
   });
 };
 

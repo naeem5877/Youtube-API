@@ -99,10 +99,16 @@ const createProxyAgent = () => {
 const makeProxyRequest = (url, options = {}) => {
   return new Promise((resolve, reject) => {
     const proxyAgent = createProxyAgent();
+    const urlObj = new URL(url);
     
     const requestOptions = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: urlObj.pathname + urlObj.search,
+      method: options.method || 'GET',
       agent: proxyAgent,
       headers: {
+        'Host': urlObj.hostname,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
@@ -112,11 +118,10 @@ const makeProxyRequest = (url, options = {}) => {
         'Upgrade-Insecure-Requests': '1',
         ...options.headers
       },
-      timeout: 30000,
-      ...options
+      timeout: 30000
     };
 
-    const request = https.request(url, requestOptions, (response) => {
+    const request = https.request(requestOptions, (response) => {
       let data = '';
       
       response.on('data', (chunk) => {
@@ -146,13 +151,61 @@ const makeProxyRequest = (url, options = {}) => {
   });
 };
 
-// Override ytdl's request function to use proxy
+// Custom fetch function using ScraperAPI
+const customFetch = async (url, options = {}) => {
+  try {
+    console.log('Making proxied request to:', url);
+    
+    // Use ScraperAPI's simple API endpoint
+    const scraperApiUrl = `http://api.scraperapi.com/?api_key=${SCRAPERAPI_KEY}&url=${encodeURIComponent(url)}&render=false&country_code=us`;
+    
+    const response = await new Promise((resolve, reject) => {
+      const request = http.request(scraperApiUrl, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        },
+        timeout: 30000
+      }, resolve);
+      
+      request.on('error', reject);
+      request.on('timeout', () => {
+        request.destroy();
+        reject(new Error('Request timeout'));
+      });
+      
+      request.end();
+    });
+
+    let data = '';
+    response.on('data', chunk => data += chunk);
+    
+    await new Promise((resolve, reject) => {
+      response.on('end', resolve);
+      response.on('error', reject);
+    });
+
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return data;
+    } else {
+      throw new Error(`HTTP ${response.statusCode}: ${data}`);
+    }
+  } catch (error) {
+    console.error('ScraperAPI request failed:', error.message);
+    throw error;
+  }
+};
+
+// Override ytdl's request function to use ScraperAPI
 const originalRequest = require('@distube/ytdl-core/lib/utils').request;
 require('@distube/ytdl-core/lib/utils').request = async (url, options = {}) => {
   try {
-    console.log('Making proxied request to:', url);
-    const result = await makeProxyRequest(url, options);
-    return result.data;
+    // Only proxy YouTube requests
+    if (url.includes('youtube.com') || url.includes('googlevideo.com')) {
+      return await customFetch(url, options);
+    } else {
+      return originalRequest(url, options);
+    }
   } catch (error) {
     console.error('Proxy request failed, falling back to original:', error.message);
     // Fallback to original request if proxy fails
@@ -160,17 +213,14 @@ require('@distube/ytdl-core/lib/utils').request = async (url, options = {}) => {
   }
 };
 
-// Create ytdl agent with better headers
+// Create ytdl agent with simpler configuration
 const createYtdlAgent = () => {
-  const proxyAgent = createProxyAgent();
-  
   return ytdl.createAgent([
     {
       "name": "VISITOR_INFO1_LIVE",
       "value": "st1td6w_9rslsToken"
     }
   ], {
-    agent: proxyAgent,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -265,10 +315,11 @@ const getVideoInfo = async (url) => {
 // Health check
 app.get('/api/health', async (req, res) => {
   try {
-    // Test proxy connection
+    // Test ScraperAPI connection
     let proxyWorking = false;
     try {
-      await makeProxyRequest('https://www.youtube.com');
+      const testUrl = 'https://www.youtube.com';
+      await customFetch(testUrl);
       proxyWorking = true;
     } catch (error) {
       console.error('Proxy test failed:', error.message);

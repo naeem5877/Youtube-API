@@ -1,6 +1,0 @@
-flask
-yt-dlp
-flask-cors
-requests
-werkzeug
-gunicorn

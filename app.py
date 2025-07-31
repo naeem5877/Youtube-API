@@ -10,6 +10,10 @@ from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import ssl
 import urllib3
+import signal
+import sys
+from contextlib import contextmanager
+import subprocess
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "https://vibedownloader.vercel.app", "https://vibedownloader.me", "https://www.vibedownloader.me", "https://ytapi.vibedownloader.me/"]}})
@@ -35,29 +39,51 @@ os.makedirs(TEMP_FOLDER, exist_ok=True)
 downloads_in_progress = {}
 completed_downloads = {}
 
+# Timeout handler
+@contextmanager
+def timeout_context(seconds):
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+    
+    # Set the signal handler and a alarm for the specified seconds
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(seconds)
+    
+    try:
+        yield
+    finally:
+        # Restore the old handler and cancel the alarm
+        signal.signal(signal.SIGALRM, old_handler)
+        signal.alarm(0)
+
 # Function to clean up old files periodically
 def cleanup_old_files():
     while True:
-        now = time.time()
-        # Delete files older than 2 hours
-        for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
-            for filename in os.listdir(folder):
-                file_path = os.path.join(folder, filename)
-                if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > 7200:  # 2 hours
-                    try:
-                        os.remove(file_path)
-                    except Exception as e:
-                        print(f"Error deleting {file_path}: {e}")
+        try:
+            now = time.time()
+            # Delete files older than 2 hours
+            for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
+                if os.path.exists(folder):
+                    for filename in os.listdir(folder):
+                        file_path = os.path.join(folder, filename)
+                        if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > 7200:  # 2 hours
+                            try:
+                                os.remove(file_path)
+                            except Exception as e:
+                                print(f"Error deleting {file_path}: {e}")
 
-        # Clean up completed downloads dictionary
-        to_remove = []
-        for download_id, info in completed_downloads.items():
-            if now - info.get("completion_time", 0) > 7200:  # 2 hours
-                to_remove.append(download_id)
+            # Clean up completed downloads dictionary
+            to_remove = []
+            for download_id, info in completed_downloads.items():
+                if now - info.get("completion_time", 0) > 7200:  # 2 hours
+                    to_remove.append(download_id)
 
-        for download_id in to_remove:
-            completed_downloads.pop(download_id, None)
+            for download_id in to_remove:
+                completed_downloads.pop(download_id, None)
 
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+        
         time.sleep(3600)  # Check every hour
 
 # Start cleanup thread
@@ -71,161 +97,197 @@ def get_base_ydl_opts():
         'no_warnings': True,
         'ignoreerrors': True,
         'proxy': 'scraperapi:d32b11d359813d5ed5c519bfbdec6f23@proxy-server.scraperapi.com:8001',
-        'socket_timeout': 30,
-        'retries': 3,
+        'socket_timeout': 20,  # Reduced timeout
+        'retries': 2,          # Reduced retries
         # SSL and certificate fixes
-        'nocheckcertificate': True,  # Disable SSL certificate verification
+        'nocheckcertificate': True,
         'geo_bypass': True,
-        'prefer_insecure': True,     # Use HTTP instead of HTTPS when possible
-        # Additional headers to help with bot detection
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-        },
-        # Additional options to handle various issues
+        'prefer_insecure': True,
+        # Memory and performance optimizations
         'extract_flat': False,
         'writesubtitles': False,
         'writeautomaticsub': False,
         'age_limit': None,
+        'no_color': True,
+        'force_json': False,
+        # Reduced headers to minimize memory usage
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Connection': 'keep-alive',
+        },
     }
     return ydl_opts
 
+def get_lightweight_ydl_opts():
+    """Return lightweight yt-dlp options for info extraction only"""
+    return {
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'proxy': 'scraperapi:d32b11d359813d5ed5c519bfbdec6f23@proxy-server.scraperapi.com:8001',
+        'socket_timeout': 15,
+        'retries': 1,
+        'nocheckcertificate': True,
+        'geo_bypass': True,
+        'prefer_insecure': True,
+        'extract_flat': True,  # Faster extraction
+        'no_color': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+    }
+
 def test_proxy_connection():
-    """Test if the proxy is working"""
+    """Test if the proxy is working with timeout"""
     try:
-        response = requests.get('https://youtube.com', 
-                              proxies=SCRAPERAPI_PROXY, 
-                              verify=False, 
-                              timeout=10,
-                              headers={
-                                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                              })
-        return response.status_code == 200
+        with timeout_context(10):
+            response = requests.get('https://youtube.com', 
+                                  proxies=SCRAPERAPI_PROXY, 
+                                  verify=False, 
+                                  timeout=8,
+                                  headers={'User-Agent': 'Mozilla/5.0'})
+            return response.status_code == 200
     except Exception as e:
         print(f"Proxy test failed: {e}")
         return False
 
+def extract_video_info_safe(url):
+    """Safely extract video info with timeout and error handling"""
+    try:
+        with timeout_context(30):  # 30 second timeout
+            ydl_opts = get_lightweight_ydl_opts()
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # First try to get basic info
+                info = ydl.extract_info(url, download=False)
+                
+                if not info:
+                    raise Exception("Could not extract video information")
+                
+                return info
+                
+    except TimeoutError:
+        raise Exception("Request timed out - video may be unavailable or proxy is slow")
+    except Exception as e:
+        print(f"Error extracting info: {e}")
+        raise Exception(f"Failed to extract video info: {str(e)}")
+
 def get_verification_status(channel_data):
     """Check if channel is verified based on badges in channel data"""
-    badges = channel_data.get('badges', [])
-    for badge in badges:
-        if badge and isinstance(badge, dict) and 'verified' in badge.get('type', '').lower():
-            return True
-    return False
+    try:
+        badges = channel_data.get('badges', [])
+        for badge in badges:
+            if badge and isinstance(badge, dict) and 'verified' in badge.get('type', '').lower():
+                return True
+        return False
+    except:
+        return False
 
 @app.route('/api/video-info', methods=['GET'])
 def get_video_info():
     """
-    Get video information including available formats
-
-    Query parameters:
-    - url: YouTube video URL
-
-    Returns:
-    - Video information including title, thumbnail, channel info, and available formats with direct download links
+    Get video information including available formats with timeout protection
     """
     url = request.args.get('url')
     if not url:
         return jsonify({"error": "Missing video URL"}), 400
 
     try:
-        ydl_opts = get_base_ydl_opts()
+        # Extract video info with timeout protection
+        info = extract_video_info_safe(url)
+        video_id = info.get('id')
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            video_id = info.get('id')
+        if not video_id:
+            return jsonify({"error": "Could not extract video ID"}), 400
 
-            # Extract relevant information
-            result = {
-                "id": video_id,
-                "title": info.get('title'),
-                "description": info.get('description'),
-                "duration": info.get('duration'),
-                "view_count": info.get('view_count'),
-                "like_count": info.get('like_count'),
-                "upload_date": info.get('upload_date'),
-                "thumbnails": info.get('thumbnails', []),
-                "channel": {
-                    "id": info.get('channel_id'),
-                    "name": info.get('channel', info.get('uploader')),
-                    "url": info.get('channel_url'),
-                    "profile_picture": None,
-                    "verified": get_verification_status(info)
-                },
-                "audio_formats": [],
-                "video_formats": []
-            }
+        # Extract relevant information safely
+        result = {
+            "id": video_id,
+            "title": info.get('title', 'Unknown Title'),
+            "description": info.get('description', '')[:500] if info.get('description') else '',  # Limit description
+            "duration": info.get('duration'),
+            "view_count": info.get('view_count'),
+            "like_count": info.get('like_count'),
+            "upload_date": info.get('upload_date'),
+            "thumbnails": info.get('thumbnails', [])[:5],  # Limit thumbnails
+            "channel": {
+                "id": info.get('channel_id'),
+                "name": info.get('channel', info.get('uploader', 'Unknown Channel')),
+                "url": info.get('channel_url'),
+                "profile_picture": None,
+                "verified": get_verification_status(info)
+            },
+            "audio_formats": [],
+            "video_formats": []
+        }
 
-            # Try to extract channel profile picture if available
-            for thumbnail in info.get('thumbnails', []):
-                if 'url' in thumbnail and 'avatar' in thumbnail.get('id', ''):
-                    result['channel']['profile_picture'] = thumbnail['url']
-                    break
-
-            # Extract audio formats
-            audio_formats = []
-            for format in info.get('formats', []):
+        # Extract formats safely
+        formats = info.get('formats', [])
+        
+        # Audio formats
+        audio_formats = []
+        for format in formats:
+            try:
                 if format.get('vcodec') == 'none' and format.get('acodec') != 'none':
                     audio_formats.append({
                         "format_id": format.get('format_id'),
-                        "ext": format.get('ext'),
+                        "ext": format.get('ext', 'unknown'),
                         "filesize": format.get('filesize'),
-                        "format_note": format.get('format_note'),
+                        "format_note": format.get('format_note', ''),
                         "abr": format.get('abr'),
                         "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}"
                     })
+                    if len(audio_formats) >= 10:  # Limit number of formats
+                        break
+            except Exception:
+                continue
 
-            result["audio_formats"] = audio_formats
+        result["audio_formats"] = audio_formats
 
-            # Extract video formats with direct download links
-            video_formats = []
-            for format in info.get('formats', []):
+        # Video formats
+        video_formats = []
+        for format in formats:
+            try:
                 if format.get('vcodec') != 'none':
                     video_formats.append({
                         "format_id": format.get('format_id'),
-                        "ext": format.get('ext'),
+                        "ext": format.get('ext', 'unknown'),
                         "filesize": format.get('filesize'),
-                        "format_note": format.get('format_note'),
+                        "format_note": format.get('format_note', ''),
                         "width": format.get('width'),
                         "height": format.get('height'),
                         "fps": format.get('fps'),
-                        "vcodec": format.get('vcodec'),
-                        "acodec": format.get('acodec'),
+                        "vcodec": format.get('vcodec', ''),
+                        "acodec": format.get('acodec', ''),
                         "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}",
                         "resolution": f"{format.get('width', 0)}x{format.get('height', 0)}"
                     })
+                    if len(video_formats) >= 15:  # Limit number of formats
+                        break
+            except Exception:
+                continue
 
-            result["video_formats"] = video_formats
+        result["video_formats"] = video_formats
 
-            return jsonify(result)
+        return jsonify(result)
 
     except Exception as e:
-        print(f"Error in get_video_info: {e}")
-        return jsonify({"error": str(e)}), 500
+        error_msg = str(e)
+        print(f"Error in get_video_info: {error_msg}")
+        
+        # Return user-friendly error messages
+        if "timed out" in error_msg.lower():
+            return jsonify({"error": "Request timed out. Please try again."}), 504
+        elif "unavailable" in error_msg.lower():
+            return jsonify({"error": "Video is unavailable or private."}), 404
+        else:
+            return jsonify({"error": f"Failed to get video info: {error_msg}"}), 500
 
 @app.route('/api/download', methods=['GET'])
 def download_video():
-    """
-    Download a video and combine with best audio
-
-    Query parameters:
-    - url: YouTube video URL
-    - format_id: (Optional) Specific video format ID to download
-    - audio_id: (Optional) Specific audio format ID to download
-
-    Returns:
-    - Download ID to check status
-    """
+    """Download a video with better error handling"""
     url = request.args.get('url')
     format_id = request.args.get('format_id')
     audio_id = request.args.get('audio_id')
@@ -250,7 +312,7 @@ def download_video():
     })
 
 def process_download(download_id, url, format_id=None, audio_id=None):
-    """Process video download and merging in background"""
+    """Process video download with timeout protection"""
     downloads_in_progress[download_id] = {
         "status": "downloading",
         "progress": 0,
@@ -259,51 +321,27 @@ def process_download(download_id, url, format_id=None, audio_id=None):
     }
 
     try:
-        output_filename = f"{download_id}.mp4"
-        output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
+        with timeout_context(300):  # 5 minute timeout for downloads
+            output_filename = f"{download_id}.mp4"
+            output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
 
-        # Configure yt-dlp options
-        ydl_opts = get_base_ydl_opts()
-        ydl_opts.update({
-            'outtmpl': os.path.join(TEMP_FOLDER, f"{download_id}_%(title)s.%(ext)s"),
-            'progress_hooks': [lambda d: update_progress(download_id, d)],
-        })
-
-        # If specific format requested
-        if format_id:
-            if audio_id:
-                # Download video and audio separately and merge
-                video_path = download_specific_format(url, format_id, f"{download_id}_video")
-                audio_path = download_specific_format(url, audio_id, f"{download_id}_audio")
-
-                # Merge video and audio
-                merge_video_audio(video_path, audio_path, output_path)
-
-                # Clean up temp files
-                if os.path.exists(video_path):
-                    os.remove(video_path)
-                if os.path.exists(audio_path):
-                    os.remove(audio_path)
-
-            else:
-                # Download specific format and merge with best audio
-                ydl_opts.update({
-                    'format': f"{format_id}+bestaudio/best",
-                    'merge_output_format': 'mp4',
-                })
-
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url)
-                    downloaded_file = ydl.prepare_filename(info)
-
-                    # Find the actual downloaded file
-                    actual_file = find_downloaded_file(downloaded_file)
-                    if actual_file and os.path.exists(actual_file):
-                        os.rename(actual_file, output_path)
-        else:
-            # Download best quality and merge
+            ydl_opts = get_base_ydl_opts()
             ydl_opts.update({
-                'format': 'bestvideo+bestaudio/best',
+                'outtmpl': os.path.join(TEMP_FOLDER, f"{download_id}_%(title)s.%(ext)s"),
+                'progress_hooks': [lambda d: update_progress(download_id, d)],
+            })
+
+            # Format selection
+            if format_id:
+                if audio_id:
+                    format_selector = f"{format_id}+{audio_id}"
+                else:
+                    format_selector = f"{format_id}+bestaudio/best"
+            else:
+                format_selector = 'bestvideo+bestaudio/best'
+
+            ydl_opts.update({
+                'format': format_selector,
                 'merge_output_format': 'mp4',
             })
 
@@ -311,41 +349,47 @@ def process_download(download_id, url, format_id=None, audio_id=None):
                 info = ydl.extract_info(url)
                 downloaded_file = ydl.prepare_filename(info)
 
-                # Find the actual downloaded file
+                # Find and move the actual downloaded file
                 actual_file = find_downloaded_file(downloaded_file)
                 if actual_file and os.path.exists(actual_file):
                     os.rename(actual_file, output_path)
 
-        # Update download info
+            completed_downloads[download_id] = {
+                "status": "completed",
+                "url": url,
+                "file_path": output_path,
+                "download_url": f"/api/get-file/{download_id}",
+                "completion_time": time.time()
+            }
+
+    except TimeoutError:
         completed_downloads[download_id] = {
-            "status": "completed",
+            "status": "failed",
             "url": url,
-            "file_path": output_path,
-            "download_url": f"/api/get-file/{download_id}",
+            "error": "Download timed out",
             "completion_time": time.time()
         }
-
     except Exception as e:
-        print(f"Error in process_download: {e}")
         completed_downloads[download_id] = {
             "status": "failed",
             "url": url,
             "error": str(e),
             "completion_time": time.time()
         }
-
     finally:
-        # Remove from in-progress
         if download_id in downloads_in_progress:
             downloads_in_progress.pop(download_id)
 
 def find_downloaded_file(base_filename):
     """Find the actual downloaded file with various possible extensions"""
+    if not base_filename:
+        return None
+        
     if os.path.exists(base_filename):
         return base_filename
     
     # Try different extensions
-    base_no_ext = base_filename.rsplit(".", 1)[0]
+    base_no_ext = base_filename.rsplit(".", 1)[0] if "." in base_filename else base_filename
     for ext in ['mp4', 'webm', 'mkv', 'm4a', 'mp3', 'f4v']:
         candidate = f"{base_no_ext}.{ext}"
         if os.path.exists(candidate):
@@ -353,67 +397,26 @@ def find_downloaded_file(base_filename):
     
     return None
 
-def download_specific_format(url, format_id, prefix):
-    """Download specific format and return file path"""
-    ydl_opts = get_base_ydl_opts()
-    ydl_opts.update({
-        'format': format_id,
-        'outtmpl': os.path.join(TEMP_FOLDER, f"{prefix}.%(ext)s"),
-    })
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url)
-        downloaded_file = ydl.prepare_filename(info)
-        return find_downloaded_file(downloaded_file)
-
-def merge_video_audio(video_path, audio_path, output_path):
-    """Merge video and audio files using ffmpeg"""
-    import subprocess
-
-    try:
-        command = [
-            'ffmpeg', '-y',  # Overwrite output file
-            '-i', video_path, '-i', audio_path,
-            '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental',
-            '-avoid_negative_ts', 'make_zero',
-            output_path
-        ]
-
-        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr}")
-        return False
-    except Exception as e:
-        print(f"Error merging files: {e}")
-        return False
-
 def update_progress(download_id, d):
-    """Update download progress information"""
-    if download_id in downloads_in_progress:
-        if d['status'] == 'downloading':
-            try:
+    """Update download progress information safely"""
+    try:
+        if download_id in downloads_in_progress:
+            if d['status'] == 'downloading':
                 percent_str = d.get('_percent_str', '0%')
-                if percent_str and percent_str != 'N/A':
-                    downloads_in_progress[download_id]['progress'] = float(percent_str.replace('%', ''))
-            except (ValueError, AttributeError):
-                pass
-        elif d['status'] == 'finished':
-            downloads_in_progress[download_id]['status'] = 'processing'
-            downloads_in_progress[download_id]['progress'] = 100
+                if percent_str and percent_str != 'N/A' and '%' in percent_str:
+                    try:
+                        downloads_in_progress[download_id]['progress'] = float(percent_str.replace('%', ''))
+                    except (ValueError, TypeError):
+                        pass
+            elif d['status'] == 'finished':
+                downloads_in_progress[download_id]['status'] = 'processing'
+                downloads_in_progress[download_id]['progress'] = 100
+    except Exception:
+        pass
 
 @app.route('/api/download-status/<download_id>', methods=['GET'])
 def check_download_status(download_id):
-    """
-    Check the status of a download
-
-    Path parameters:
-    - download_id: ID of the download to check
-
-    Returns:
-    - Download status information
-    """
-    # Check if download is in progress
+    """Check download status"""
     if download_id in downloads_in_progress:
         return jsonify({
             "download_id": download_id,
@@ -422,7 +425,6 @@ def check_download_status(download_id):
             "url": downloads_in_progress[download_id]["url"]
         })
 
-    # Check if download is completed
     if download_id in completed_downloads:
         response_data = {
             "download_id": download_id,
@@ -442,15 +444,7 @@ def check_download_status(download_id):
 
 @app.route('/api/get-file/<download_id>', methods=['GET'])
 def get_downloaded_file(download_id):
-    """
-    Get a downloaded file
-
-    Path parameters:
-    - download_id: ID of the download to get
-
-    Returns:
-    - The downloaded file
-    """
+    """Get downloaded file"""
     if download_id in completed_downloads and completed_downloads[download_id]["status"] == "completed":
         file_path = completed_downloads[download_id]["file_path"]
 
@@ -462,138 +456,73 @@ def get_downloaded_file(download_id):
 
 @app.route('/api/direct-download/<video_id>/<format_id>', methods=['GET'])
 def direct_download(video_id, format_id):
-    """
-    Direct download endpoint that combines video with best audio and sends the file
-
-    Path parameters:
-    - video_id: YouTube video ID
-    - format_id: Format ID to download
-
-    Query parameters:
-    - audio_id: (Optional) Specific audio format ID
-    - filename: (Optional) Custom filename for the download
-
-    Returns:
-    - The downloaded file directly to the browser
-    """
-    audio_id = request.args.get('audio_id')
-    custom_filename = request.args.get('filename')
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
+    """Direct download with timeout protection"""
     try:
-        # Create a unique filename based on video ID and format
-        filename = f"{video_id}_{format_id}"
-        if audio_id:
-            filename += f"_{audio_id}"
-        filename += ".mp4"
+        with timeout_context(180):  # 3 minute timeout
+            audio_id = request.args.get('audio_id')
+            custom_filename = request.args.get('filename')
+            url = f"https://www.youtube.com/watch?v={video_id}"
 
-        output_path = os.path.join(DOWNLOAD_FOLDER, filename)
+            # Create filename
+            filename = f"{video_id}_{format_id}"
+            if audio_id:
+                filename += f"_{audio_id}"
+            filename += ".mp4"
 
-        # Check if file already exists (cached)
-        if os.path.exists(output_path):
-            download_name = custom_filename if custom_filename else f"{video_id}.mp4"
-            return send_file(output_path, as_attachment=True, download_name=download_name)
+            output_path = os.path.join(DOWNLOAD_FOLDER, filename)
 
-        # Set up download options
-        ydl_opts = get_base_ydl_opts()
-
-        # Add progress hooks
-        download_id = str(uuid.uuid4())
-        downloads_in_progress[download_id] = {
-            "status": "downloading",
-            "progress": 0,
-            "url": url,
-            "start_time": time.time()
-        }
-
-        ydl_opts.update({
-            'progress_hooks': [lambda d: update_progress(download_id, d)],
-            'outtmpl': output_path,
-        })
-
-        # Configure format selection
-        if audio_id:
-            format_selector = f"{format_id}+{audio_id}"
-        else:
-            # Check if format is audio-only or video-only
-            with yt_dlp.YoutubeDL(get_base_ydl_opts()) as ydl:
-                info = ydl.extract_info(url, download=False)
-                target_format = None
-                for fmt in info.get('formats', []):
-                    if fmt.get('format_id') == format_id:
-                        target_format = fmt
-                        break
-                
-                if target_format and target_format.get('acodec') == 'none':
-                    # Video-only format, combine with best audio
-                    format_selector = f"{format_id}+bestaudio"
-                else:
-                    # Audio-only or combined format
-                    format_selector = format_id
-
-        ydl_opts.update({
-            'format': format_selector,
-            'merge_output_format': 'mp4',
-        })
-
-        # Download the file
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url)
-
-            # Get the actual title for a better filename if not provided
-            if not custom_filename and info.get('title'):
-                video_title = info.get('title')
-                # Clean the title for use as a filename
-                video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')
-                download_name = f"{video_title}.mp4"
-            else:
+            # Check cache
+            if os.path.exists(output_path):
                 download_name = custom_filename if custom_filename else f"{video_id}.mp4"
+                return send_file(output_path, as_attachment=True, download_name=download_name)
 
-        # Update downloads info and remove from in-progress
-        if download_id in downloads_in_progress:
-            downloads_in_progress.pop(download_id)
+            # Download
+            ydl_opts = get_base_ydl_opts()
+            ydl_opts.update({
+                'outtmpl': output_path,
+                'format': f"{format_id}+bestaudio" if not audio_id else f"{format_id}+{audio_id}",
+                'merge_output_format': 'mp4',
+            })
 
-        completed_downloads[download_id] = {
-            "status": "completed",
-            "url": url,
-            "file_path": output_path,
-            "completion_time": time.time()
-        }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url)
+                
+                if not custom_filename and info.get('title'):
+                    video_title = ''.join(c for c in info.get('title') if c.isalnum() or c in ' ._-')
+                    download_name = f"{video_title}.mp4"
+                else:
+                    download_name = custom_filename if custom_filename else f"{video_id}.mp4"
 
-        # Find the actual downloaded file
-        actual_file = find_downloaded_file(output_path)
-        if actual_file and os.path.exists(actual_file):
-            # If the file was downloaded with a different name, rename it
-            if actual_file != output_path:
-                os.rename(actual_file, output_path)
-            return send_file(output_path, as_attachment=True, download_name=download_name)
-        else:
-            return jsonify({"error": "Download failed - file not found"}), 500
+            # Find and serve file
+            actual_file = find_downloaded_file(output_path)
+            if actual_file and os.path.exists(actual_file):
+                if actual_file != output_path:
+                    os.rename(actual_file, output_path)
+                return send_file(output_path, as_attachment=True, download_name=download_name)
+            else:
+                return jsonify({"error": "Download failed"}), 500
 
+    except TimeoutError:
+        return jsonify({"error": "Download timed out"}), 504
     except Exception as e:
-        print(f"Error in direct_download: {e}")
-        # Clean up progress tracking
-        if download_id in downloads_in_progress:
-            downloads_in_progress.pop(download_id)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/proxy-test', methods=['GET'])
 def test_proxy():
-    """Test if the ScraperAPI proxy is working"""
+    """Test proxy with timeout"""
     try:
-        response = requests.get('https://youtube.com', 
-                              proxies=SCRAPERAPI_PROXY, 
-                              verify=False, 
-                              timeout=10,
-                              headers={
-                                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                              })
-        return jsonify({
-            "status": "success",
-            "proxy_working": True,
-            "status_code": response.status_code,
-            "message": "Proxy connection successful"
-        })
+        with timeout_context(10):
+            response = requests.get('https://youtube.com', 
+                                  proxies=SCRAPERAPI_PROXY, 
+                                  verify=False, 
+                                  timeout=8,
+                                  headers={'User-Agent': 'Mozilla/5.0'})
+            return jsonify({
+                "status": "success",
+                "proxy_working": True,
+                "status_code": response.status_code,
+                "message": "Proxy connection successful"
+            })
     except Exception as e:
         return jsonify({
             "status": "error",
@@ -604,22 +533,32 @@ def test_proxy():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Simple health check endpoint"""
-    proxy_status = test_proxy_connection()
-    return jsonify({
-        "status": "ok",
-        "version": "1.0.1",
-        "proxy_working": proxy_status,
-        "proxy_config": "ScraperAPI enabled with SSL bypass"
-    })
+    """Health check with timeout"""
+    try:
+        proxy_status = test_proxy_connection()
+        return jsonify({
+            "status": "ok",
+            "version": "1.0.2",
+            "proxy_working": proxy_status,
+            "proxy_config": "ScraperAPI with timeout protection"
+        })
+    except:
+        return jsonify({
+            "status": "ok",
+            "version": "1.0.2",
+            "proxy_working": False,
+            "proxy_config": "ScraperAPI with timeout protection"
+        })
 
 if __name__ == '__main__':
-    # Test proxy connection on startup
-    print("Testing ScraperAPI proxy connection...")
-    if test_proxy_connection():
-        print("✓ Proxy connection successful")
-    else:
-        print("✗ Proxy connection failed - downloads may not work properly")
+    print("Starting YouTube Downloader with timeout protection...")
+    try:
+        print("Testing ScraperAPI proxy connection...")
+        if test_proxy_connection():
+            print("✓ Proxy connection successful")
+        else:
+            print("✗ Proxy connection failed - downloads may not work properly")
+    except:
+        print("✗ Could not test proxy connection")
     
-    # For Replit, use this configuration
     app.run(host='0.0.0.0', port=8080)

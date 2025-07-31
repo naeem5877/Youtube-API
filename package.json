@@ -1,23 +1,26 @@
 {
   "name": "nodejs",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "YouTube Downloader API",
+  "main": "server.js",
   "scripts": {
+    "build": "apt-get update && apt-get install -y ffmpeg && npm install",
+    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "keywords": ["youtube", "downloader", "api"],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",
-    "@types/node": "^22.13.11",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "fluent-ffmpeg": "^2.1.3",
     "multer": "^2.0.2",
     "puppeteer": "^24.15.0",
-    "uuid": "^11.1.0",
-    "ytdl-core": "^4.11.5"
+    "uuid": "^11.1.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

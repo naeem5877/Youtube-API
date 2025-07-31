@@ -8,9 +8,14 @@ import json
 import requests
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
+import ssl
+import urllib3
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "https://vibedownloader.vercel.app", "https://vibedownloader.me", "https://www.vibedownloader.me", "https://ytapi.vibedownloader.me/"]}})
+
+# Disable SSL warnings for proxy usage
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuration
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), "downloads")
@@ -60,7 +65,7 @@ cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
 def get_base_ydl_opts():
-    """Return base yt-dlp options with proxy configuration"""
+    """Return base yt-dlp options with proxy configuration and SSL fixes"""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -68,23 +73,43 @@ def get_base_ydl_opts():
         'proxy': 'scraperapi:d32b11d359813d5ed5c519bfbdec6f23@proxy-server.scraperapi.com:8001',
         'socket_timeout': 30,
         'retries': 3,
+        # SSL and certificate fixes
+        'nocheckcertificate': True,  # Disable SSL certificate verification
+        'geo_bypass': True,
+        'prefer_insecure': True,     # Use HTTP instead of HTTPS when possible
         # Additional headers to help with bot detection
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Accept-Encoding': 'gzip,deflate',
-            'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
-            'Keep-Alive': '300',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
             'Connection': 'keep-alive',
-        }
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        },
+        # Additional options to handle various issues
+        'extract_flat': False,
+        'writesubtitles': False,
+        'writeautomaticsub': False,
+        'age_limit': None,
     }
     return ydl_opts
 
 def test_proxy_connection():
     """Test if the proxy is working"""
     try:
-        response = requests.get('https://youtube.com', proxies=SCRAPERAPI_PROXY, verify=False, timeout=10)
+        response = requests.get('https://youtube.com', 
+                              proxies=SCRAPERAPI_PROXY, 
+                              verify=False, 
+                              timeout=10,
+                              headers={
+                                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                              })
         return response.status_code == 200
     except Exception as e:
         print(f"Proxy test failed: {e}")
@@ -185,6 +210,7 @@ def get_video_info():
             return jsonify(result)
 
     except Exception as e:
+        print(f"Error in get_video_info: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/download', methods=['GET'])
@@ -262,24 +288,22 @@ def process_download(download_id, url, format_id=None, audio_id=None):
             else:
                 # Download specific format and merge with best audio
                 ydl_opts.update({
-                    'format': f"{format_id}+bestaudio",
+                    'format': f"{format_id}+bestaudio/best",
                     'merge_output_format': 'mp4',
-                    'final_filepath': output_path
                 })
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url)
                     downloaded_file = ydl.prepare_filename(info)
 
-                    # Move to downloads folder with proper name
-                    if downloaded_file and os.path.exists(downloaded_file):
-                        os.rename(downloaded_file, output_path)
-                    elif downloaded_file and os.path.exists(downloaded_file.rsplit(".", 1)[0] + ".mp4"):
-                        os.rename(downloaded_file.rsplit(".", 1)[0] + ".mp4", output_path)
+                    # Find the actual downloaded file
+                    actual_file = find_downloaded_file(downloaded_file)
+                    if actual_file and os.path.exists(actual_file):
+                        os.rename(actual_file, output_path)
         else:
             # Download best quality and merge
             ydl_opts.update({
-                'format': 'bestvideo+bestaudio',
+                'format': 'bestvideo+bestaudio/best',
                 'merge_output_format': 'mp4',
             })
 
@@ -287,11 +311,10 @@ def process_download(download_id, url, format_id=None, audio_id=None):
                 info = ydl.extract_info(url)
                 downloaded_file = ydl.prepare_filename(info)
 
-                # Move to downloads folder with proper name
-                if downloaded_file and os.path.exists(downloaded_file):
-                    os.rename(downloaded_file, output_path)
-                elif downloaded_file and os.path.exists(downloaded_file.rsplit(".", 1)[0] + ".mp4"):
-                    os.rename(downloaded_file.rsplit(".", 1)[0] + ".mp4", output_path)
+                # Find the actual downloaded file
+                actual_file = find_downloaded_file(downloaded_file)
+                if actual_file and os.path.exists(actual_file):
+                    os.rename(actual_file, output_path)
 
         # Update download info
         completed_downloads[download_id] = {
@@ -303,6 +326,7 @@ def process_download(download_id, url, format_id=None, audio_id=None):
         }
 
     except Exception as e:
+        print(f"Error in process_download: {e}")
         completed_downloads[download_id] = {
             "status": "failed",
             "url": url,
@@ -315,10 +339,22 @@ def process_download(download_id, url, format_id=None, audio_id=None):
         if download_id in downloads_in_progress:
             downloads_in_progress.pop(download_id)
 
+def find_downloaded_file(base_filename):
+    """Find the actual downloaded file with various possible extensions"""
+    if os.path.exists(base_filename):
+        return base_filename
+    
+    # Try different extensions
+    base_no_ext = base_filename.rsplit(".", 1)[0]
+    for ext in ['mp4', 'webm', 'mkv', 'm4a', 'mp3', 'f4v']:
+        candidate = f"{base_no_ext}.{ext}"
+        if os.path.exists(candidate):
+            return candidate
+    
+    return None
+
 def download_specific_format(url, format_id, prefix):
     """Download specific format and return file path"""
-    temp_path = os.path.join(TEMP_FOLDER, f"{prefix}.mp4")
-
     ydl_opts = get_base_ydl_opts()
     ydl_opts.update({
         'format': format_id,
@@ -328,18 +364,7 @@ def download_specific_format(url, format_id, prefix):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url)
         downloaded_file = ydl.prepare_filename(info)
-
-        # Find the actual downloaded file (extension might be different)
-        actual_file = downloaded_file
-        if not os.path.exists(actual_file):
-            # Try to find the file with different extensions
-            for ext in ['mp4', 'webm', 'mkv', 'm4a', 'mp3']:
-                candidate = downloaded_file.rsplit(".", 1)[0] + f".{ext}"
-                if os.path.exists(candidate):
-                    actual_file = candidate
-                    break
-
-    return actual_file
+        return find_downloaded_file(downloaded_file)
 
 def merge_video_audio(video_path, audio_path, output_path):
     """Merge video and audio files using ffmpeg"""
@@ -347,13 +372,18 @@ def merge_video_audio(video_path, audio_path, output_path):
 
     try:
         command = [
-            'ffmpeg', '-i', video_path, '-i', audio_path,
+            'ffmpeg', '-y',  # Overwrite output file
+            '-i', video_path, '-i', audio_path,
             '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental',
+            '-avoid_negative_ts', 'make_zero',
             output_path
         ]
 
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return True
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg error: {e.stderr}")
+        return False
     except Exception as e:
         print(f"Error merging files: {e}")
         return False
@@ -363,8 +393,10 @@ def update_progress(download_id, d):
     if download_id in downloads_in_progress:
         if d['status'] == 'downloading':
             try:
-                downloads_in_progress[download_id]['progress'] = float(d.get('_percent_str', '0%').replace('%', ''))
-            except:
+                percent_str = d.get('_percent_str', '0%')
+                if percent_str and percent_str != 'N/A':
+                    downloads_in_progress[download_id]['progress'] = float(percent_str.replace('%', ''))
+            except (ValueError, AttributeError):
                 pass
         elif d['status'] == 'finished':
             downloads_in_progress[download_id]['status'] = 'processing'
@@ -392,12 +424,19 @@ def check_download_status(download_id):
 
     # Check if download is completed
     if download_id in completed_downloads:
-        return jsonify({
+        response_data = {
             "download_id": download_id,
             "status": completed_downloads[download_id]["status"],
-            "url": completed_downloads[download_id]["url"],
-            "download_url": completed_downloads[download_id].get("download_url")
-        })
+            "url": completed_downloads[download_id]["url"]
+        }
+        
+        if "download_url" in completed_downloads[download_id]:
+            response_data["download_url"] = completed_downloads[download_id]["download_url"]
+        
+        if "error" in completed_downloads[download_id]:
+            response_data["error"] = completed_downloads[download_id]["error"]
+            
+        return jsonify(response_data)
 
     return jsonify({"error": "Download ID not found"}), 404
 
@@ -469,17 +508,32 @@ def direct_download(video_id, format_id):
 
         ydl_opts.update({
             'progress_hooks': [lambda d: update_progress(download_id, d)],
+            'outtmpl': output_path,
         })
 
-        # Always combine with best audio if format is video-only
+        # Configure format selection
+        if audio_id:
+            format_selector = f"{format_id}+{audio_id}"
+        else:
+            # Check if format is audio-only or video-only
+            with yt_dlp.YoutubeDL(get_base_ydl_opts()) as ydl:
+                info = ydl.extract_info(url, download=False)
+                target_format = None
+                for fmt in info.get('formats', []):
+                    if fmt.get('format_id') == format_id:
+                        target_format = fmt
+                        break
+                
+                if target_format and target_format.get('acodec') == 'none':
+                    # Video-only format, combine with best audio
+                    format_selector = f"{format_id}+bestaudio"
+                else:
+                    # Audio-only or combined format
+                    format_selector = format_id
+
         ydl_opts.update({
-            'format': f"{format_id}+bestaudio" if not audio_id else f"{format_id}+{audio_id}",
-            'outtmpl': output_path,
+            'format': format_selector,
             'merge_output_format': 'mp4',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
         })
 
         # Download the file
@@ -506,20 +560,34 @@ def direct_download(video_id, format_id):
             "completion_time": time.time()
         }
 
-        # Check if download was successful
-        if os.path.exists(output_path):
+        # Find the actual downloaded file
+        actual_file = find_downloaded_file(output_path)
+        if actual_file and os.path.exists(actual_file):
+            # If the file was downloaded with a different name, rename it
+            if actual_file != output_path:
+                os.rename(actual_file, output_path)
             return send_file(output_path, as_attachment=True, download_name=download_name)
         else:
-            return jsonify({"error": "Download failed"}), 500
+            return jsonify({"error": "Download failed - file not found"}), 500
 
     except Exception as e:
+        print(f"Error in direct_download: {e}")
+        # Clean up progress tracking
+        if download_id in downloads_in_progress:
+            downloads_in_progress.pop(download_id)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/proxy-test', methods=['GET'])
 def test_proxy():
     """Test if the ScraperAPI proxy is working"""
     try:
-        response = requests.get('https://youtube.com', proxies=SCRAPERAPI_PROXY, verify=False, timeout=10)
+        response = requests.get('https://youtube.com', 
+                              proxies=SCRAPERAPI_PROXY, 
+                              verify=False, 
+                              timeout=10,
+                              headers={
+                                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                              })
         return jsonify({
             "status": "success",
             "proxy_working": True,
@@ -540,9 +608,9 @@ def health_check():
     proxy_status = test_proxy_connection()
     return jsonify({
         "status": "ok",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "proxy_working": proxy_status,
-        "proxy_config": "ScraperAPI enabled"
+        "proxy_config": "ScraperAPI enabled with SSL bypass"
     })
 
 if __name__ == '__main__':

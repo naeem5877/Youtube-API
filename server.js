@@ -8,14 +8,15 @@ const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const https = require('https');
 const http = require('http');
-const { HttpsProxyAgent } = require('https-proxy-agent');
+const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// ScraperAPI configuration
-const SCRAPERAPI_KEY = process.env.SCRAPERAPI_KEY || 'd32b11d359813d5ed5c519bfbdec6f23';
-const PROXY_URL = `http://scraperapi:${SCRAPERAPI_KEY}@proxy-server.scraperapi.com:8001`;
+// SOCKS Proxy configuration
+const PROXY_HOST = '116.206.151.198';
+const PROXY_PORT = 4153;
+const PROXY_URL = `socks5://${PROXY_HOST}:${PROXY_PORT}`;
 
 // Rate limiting configuration
 const REQUEST_DELAY = 3000; // 3 seconds between requests
@@ -99,7 +100,7 @@ const createDirectories = async () => {
 const downloadsInProgress = new Map();
 const completedDownloads = new Map();
 
-// Cleanup function (same as before)
+// Cleanup function
 const cleanupOldFiles = async () => {
   const now = Date.now();
   const twoHours = 2 * 60 * 60 * 1000;
@@ -136,36 +137,46 @@ const cleanupOldFiles = async () => {
 
 setInterval(cleanupOldFiles, 60 * 60 * 1000);
 
-// Improved proxy request with better error handling and retries
-const makeScraperAPIRequest = async (url, retryCount = 0) => {
+// Create SOCKS proxy agent
+const createSocksAgent = () => {
+  return new SocksProxyAgent(PROXY_URL);
+};
+
+// Make request through SOCKS proxy
+const makeSocksProxyRequest = async (url, retryCount = 0) => {
   try {
-    console.log(`Making ScraperAPI request (attempt ${retryCount + 1}):`, url);
+    console.log(`Making SOCKS proxy request (attempt ${retryCount + 1}):`, url);
     
-    // Use ScraperAPI's API endpoint with better parameters
-    const scraperApiUrl = new URL('http://api.scraperapi.com/');
-    scraperApiUrl.searchParams.set('api_key', SCRAPERAPI_KEY);
-    scraperApiUrl.searchParams.set('url', url);
-    scraperApiUrl.searchParams.set('render', 'false');
-    scraperApiUrl.searchParams.set('country_code', 'us');
-    scraperApiUrl.searchParams.set('premium', 'true'); // Use premium if available
-    scraperApiUrl.searchParams.set('session_number', Math.floor(Math.random() * 100)); // Random session
+    const agent = createSocksAgent();
+    const urlObj = new URL(url);
+    
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: urlObj.pathname + urlObj.search,
+      method: 'GET',
+      agent: agent,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Referer': 'https://www.youtube.com/',
+        'Origin': 'https://www.youtube.com'
+      },
+      timeout: 45000
+    };
+
+    const requestModule = urlObj.protocol === 'https:' ? https : http;
     
     const response = await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error('Request timeout'));
-      }, 45000); // 45 second timeout
+      }, 45000);
       
-      const request = http.request(scraperApiUrl.toString(), {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept-Encoding': 'gzip, deflate',
-          'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache'
-        }
-      }, (res) => {
+      const request = requestModule.request(options, (res) => {
         clearTimeout(timeout);
         resolve(res);
       });
@@ -173,6 +184,11 @@ const makeScraperAPIRequest = async (url, retryCount = 0) => {
       request.on('error', (err) => {
         clearTimeout(timeout);
         reject(err);
+      });
+      
+      request.setTimeout(45000, () => {
+        request.destroy();
+        reject(new Error('Request timeout'));
       });
       
       request.end();
@@ -187,36 +203,38 @@ const makeScraperAPIRequest = async (url, retryCount = 0) => {
     });
 
     if (response.statusCode >= 200 && response.statusCode < 300) {
-      console.log(`ScraperAPI request successful (${response.statusCode})`);
+      console.log(`SOCKS proxy request successful (${response.statusCode})`);
       return data;
     } else if (response.statusCode === 429 && retryCount < MAX_RETRIES) {
-      // Rate limited, wait and retry
       console.log(`Rate limited (429), retrying in ${RETRY_DELAY}ms...`);
       await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (retryCount + 1)));
-      return makeScraperAPIRequest(url, retryCount + 1);
+      return makeSocksProxyRequest(url, retryCount + 1);
     } else {
       throw new Error(`HTTP ${response.statusCode}: ${data}`);
     }
   } catch (error) {
     if (retryCount < MAX_RETRIES && !error.message.includes('timeout')) {
-      console.log(`Request failed, retrying in ${RETRY_DELAY}ms:`, error.message);
+      console.log(`SOCKS proxy request failed, retrying in ${RETRY_DELAY}ms:`, error.message);
       await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (retryCount + 1)));
-      return makeScraperAPIRequest(url, retryCount + 1);
+      return makeSocksProxyRequest(url, retryCount + 1);
     }
     
-    console.error('ScraperAPI request failed after retries:', error.message);
+    console.error('SOCKS proxy request failed after retries:', error.message);
     throw error;
   }
 };
 
-// Alternative method using different approach
-const makeAlternativeRequest = async (url) => {
+// Alternative direct request method
+const makeDirectRequest = async (url) => {
   try {
-    // Use different ScraperAPI endpoint
-    const response = await fetch(`https://api.scraperapi.com/?api_key=${SCRAPERAPI_KEY}&url=${encodeURIComponent(url)}&render=false&country_code=us&premium=true`, {
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.youtube.com/',
+        'Origin': 'https://www.youtube.com'
       },
       timeout: 30000
     });
@@ -227,53 +245,36 @@ const makeAlternativeRequest = async (url) => {
     
     return await response.text();
   } catch (error) {
-    console.error('Alternative request failed:', error.message);
+    console.error('Direct request failed:', error.message);
     throw error;
   }
 };
 
-// Custom fetch function with multiple fallback strategies
+// Custom fetch function with SOCKS proxy fallback
 const customFetch = async (url, options = {}) => {
   try {
-    // First try: ScraperAPI with retries
-    return await makeScraperAPIRequest(url);
+    // First try: SOCKS proxy
+    return await makeSocksProxyRequest(url);
   } catch (error) {
-    console.log('Primary ScraperAPI failed, trying alternative approach...');
+    console.log('SOCKS proxy failed, trying direct request with delay...');
     
     try {
-      // Second try: Alternative ScraperAPI method
-      return await makeAlternativeRequest(url);
-    } catch (altError) {
-      console.log('Alternative method failed, using direct request with delay...');
-      
-      // Third try: Direct request with long delay (last resort)
-      await new Promise(resolve => setTimeout(resolve, 10000)); // 10 second delay
-      
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Referer': 'https://www.youtube.com/',
-          'Origin': 'https://www.youtube.com'
-        },
-        timeout: 20000
-      });
-      
-      if (!response.ok) {
-        throw new Error(`Direct request failed: HTTP ${response.status}`);
-      }
-      
-      return await response.text();
+      // Second try: Direct request with delay
+      await new Promise(resolve => setTimeout(resolve, 5000)); // 5 second delay
+      return await makeDirectRequest(url);
+    } catch (directError) {
+      console.error('All request methods failed');
+      throw new Error(`Both SOCKS proxy and direct requests failed. SOCKS: ${error.message}, Direct: ${directError.message}`);
     }
   }
 };
 
-// Create multiple ytdl agents with different configurations
+// Create ytdl agents with SOCKS proxy
 const createYtdlAgents = () => {
   const agents = [];
+  const socksAgent = createSocksAgent();
   
-  // Agent 1: Basic configuration
+  // Agent 1: With SOCKS proxy
   agents.push(ytdl.createAgent([
     {
       "name": "VISITOR_INFO1_LIVE",
@@ -284,10 +285,12 @@ const createYtdlAgents = () => {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9'
-    }
+    },
+    httpAgent: socksAgent,
+    httpsAgent: socksAgent
   }));
   
-  // Agent 2: Different session
+  // Agent 2: Basic agent (fallback)
   agents.push(ytdl.createAgent([
     {
       "name": "VISITOR_INFO1_LIVE",
@@ -304,7 +307,7 @@ const createYtdlAgents = () => {
   return agents;
 };
 
-// Override ytdl's request function to use our custom fetch
+// Override ytdl's request function
 const originalRequest = require('@distube/ytdl-core/lib/utils').request;
 require('@distube/ytdl-core/lib/utils').request = async (url, options = {}) => {
   try {
@@ -316,29 +319,37 @@ require('@distube/ytdl-core/lib/utils').request = async (url, options = {}) => {
     }
   } catch (error) {
     console.error('Custom request failed:', error.message);
-    // Don't fallback to original for YouTube URLs as it will likely fail too
     throw error;
   }
 };
 
-// Improved video info function with better error handling
+// Test SOCKS proxy connection
+const testSocksProxy = async () => {
+  try {
+    const testUrl = 'https://www.youtube.com';
+    await makeSocksProxyRequest(testUrl);
+    return { working: true, error: null };
+  } catch (error) {
+    return { working: false, error: error.message };
+  }
+};
+
+// Improved video info function
 const getVideoInfo = async (url) => {
   const agents = createYtdlAgents();
   let lastError;
   
-  // Try with different agents
   for (let i = 0; i < agents.length; i++) {
     try {
       console.log(`Attempting to get video info with agent ${i + 1}...`);
       
-      // Add random delay to avoid patterns
       await new Promise(resolve => setTimeout(resolve, 2000 + Math.random() * 3000));
       
       const info = await ytdl.getInfo(url, { 
         agent: agents[i],
         requestOptions: {
           headers: {
-            'User-Agent': agents[i].jar._jar.store.idx['youtube.com']['/'].VISITOR_INFO1_LIVE ? 
+            'User-Agent': i === 0 ? 
               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' :
               'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
           }
@@ -348,7 +359,6 @@ const getVideoInfo = async (url) => {
       const videoDetails = info.videoDetails;
       const formats = info.formats;
 
-      // Filter and map audio formats
       const audioFormats = formats
         .filter(format => format.hasAudio && !format.hasVideo && format.audioBitrate)
         .map(format => ({
@@ -361,7 +371,6 @@ const getVideoInfo = async (url) => {
         }))
         .sort((a, b) => (b.abr || 0) - (a.abr || 0));
 
-      // Filter and map video formats
       const videoFormats = formats
         .filter(format => format.hasVideo && format.height)
         .map(format => ({
@@ -404,7 +413,6 @@ const getVideoInfo = async (url) => {
       console.error(`Agent ${i + 1} failed:`, error.message);
       lastError = error;
       
-      // If rate limited, wait longer before trying next agent
       if (error.message.includes('429') || error.message.includes('rate')) {
         console.log('Rate limited, waiting 10 seconds before next attempt...');
         await new Promise(resolve => setTimeout(resolve, 10000));
@@ -417,27 +425,19 @@ const getVideoInfo = async (url) => {
 
 // Routes
 
-// Health check with improved proxy testing
+// Health check with SOCKS proxy testing
 app.get('/api/health', async (req, res) => {
   try {
-    let proxyWorking = false;
-    let proxyError = null;
-    
-    try {
-      const testUrl = 'https://www.youtube.com';
-      await customFetch(testUrl);
-      proxyWorking = true;
-    } catch (error) {
-      proxyError = error.message;
-      console.error('Proxy test failed:', error.message);
-    }
+    const proxyTest = await testSocksProxy();
 
     res.json({
       status: 'ok',
-      version: '2.1.0',
-      proxyEnabled: !!SCRAPERAPI_KEY,
-      proxyWorking,
-      proxyError,
+      version: '2.2.0',
+      proxyType: 'SOCKS5',
+      proxyHost: PROXY_HOST,
+      proxyPort: PROXY_PORT,
+      proxyWorking: proxyTest.working,
+      proxyError: proxyTest.error,
       queueLength: requestQueue.queue.length,
       platform: 'nodejs'
     });
@@ -446,7 +446,7 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// Get video information with improved error handling
+// Get video information
 app.get('/api/video-info', async (req, res) => {
   const { url } = req.query;
 
@@ -464,7 +464,6 @@ app.get('/api/video-info', async (req, res) => {
   } catch (error) {
     console.error('Video info endpoint error:', error);
     
-    // Provide more specific error messages
     let errorMessage = error.message;
     if (error.message.includes('429')) {
       errorMessage = 'YouTube is currently rate limiting requests. Please try again in a few minutes.';
@@ -476,12 +475,12 @@ app.get('/api/video-info', async (req, res) => {
     
     res.status(500).json({ 
       error: errorMessage,
-      retryAfter: error.message.includes('429') ? 300 : null // 5 minutes
+      retryAfter: error.message.includes('429') ? 300 : null
     });
   }
 });
 
-// Start download (rest of the endpoints remain the same but use the improved getVideoInfo)
+// Start download
 app.get('/api/download', async (req, res) => {
   const { url, format_id } = req.query;
 
@@ -495,7 +494,6 @@ app.get('/api/download', async (req, res) => {
 
   const downloadId = uuidv4();
 
-  // Start download in background
   processDownload(downloadId, url, format_id);
 
   res.json({
@@ -505,7 +503,7 @@ app.get('/api/download', async (req, res) => {
   });
 });
 
-// Process download function (updated to use new getVideoInfo)
+// Process download function
 const processDownload = async (downloadId, url, formatId) => {
   downloadsInProgress.set(downloadId, {
     status: 'downloading',
@@ -518,7 +516,6 @@ const processDownload = async (downloadId, url, formatId) => {
     const agents = createYtdlAgents();
     let info;
     
-    // Try to get info with different agents
     for (const agent of agents) {
       try {
         await new Promise(resolve => setTimeout(resolve, 3000 + Math.random() * 2000));
@@ -544,7 +541,6 @@ const processDownload = async (downloadId, url, formatId) => {
     const title = videoDetails.title.replace(/[^\w\s-]/g, '').trim();
     const outputPath = path.join(DOWNLOAD_FOLDER, `${downloadId}_${title}.mp4`);
 
-    // Get best video and audio formats
     const videoFormat = formatId ? 
       info.formats.find(f => f.itag.toString() === formatId) :
       ytdl.chooseFormat(info.formats, { quality: 'highestvideo' });
@@ -555,10 +551,8 @@ const processDownload = async (downloadId, url, formatId) => {
       throw new Error('Could not find suitable video or audio format');
     }
 
-    // Use the first working agent for download
     const workingAgent = agents[0];
 
-    // If video format has audio, just download it directly
     if (videoFormat.hasAudio) {
       const stream = ytdl(url, { 
         format: videoFormat, 
@@ -609,35 +603,27 @@ const processDownload = async (downloadId, url, formatId) => {
         });
       });
     } else {
-      // Download video and audio separately, then merge
       const videoPath = path.join(TEMP_FOLDER, `${downloadId}_video.${videoFormat.container}`);
       const audioPath = path.join(TEMP_FOLDER, `${downloadId}_audio.${audioFormat.container}`);
 
-      // Update status
       const downloadInfo = downloadsInProgress.get(downloadId);
       if (downloadInfo) downloadInfo.status = 'downloading_video';
 
-      // Download video
       await downloadStream(url, videoFormat, videoPath, downloadId, 'video', workingAgent);
 
-      // Update status
       if (downloadsInProgress.has(downloadId)) {
         downloadsInProgress.get(downloadId).status = 'downloading_audio';
       }
 
-      // Download audio
       await downloadStream(url, audioFormat, audioPath, downloadId, 'audio', workingAgent);
 
-      // Update status
       if (downloadsInProgress.has(downloadId)) {
         downloadsInProgress.get(downloadId).status = 'merging';
         downloadsInProgress.get(downloadId).progress = 90;
       }
 
-      // Merge video and audio
       await mergeVideoAudio(videoPath, audioPath, outputPath);
 
-      // Clean up temp files
       try {
         await fs.unlink(videoPath);
         await fs.unlink(audioPath);
@@ -667,7 +653,7 @@ const processDownload = async (downloadId, url, formatId) => {
   }
 };
 
-// Helper function to download stream to file (same as before)
+// Helper function to download stream to file
 const downloadStream = (url, format, outputPath, downloadId, type, agent) => {
   return new Promise((resolve, reject) => {
     const stream = ytdl(url, { 
@@ -703,7 +689,7 @@ const downloadStream = (url, format, outputPath, downloadId, type, agent) => {
   });
 };
 
-// Helper function to merge video and audio using ffmpeg (same as before)
+// Helper function to merge video and audio using ffmpeg
 const mergeVideoAudio = (videoPath, audioPath, outputPath) => {
   return new Promise((resolve, reject) => {
     ffmpeg()
@@ -727,7 +713,7 @@ const mergeVideoAudio = (videoPath, audioPath, outputPath) => {
   });
 };
 
-// Rest of the endpoints remain the same...
+// Download status endpoint
 app.get('/api/download-status/:downloadId', (req, res) => {
   const { downloadId } = req.params;
 
@@ -755,6 +741,7 @@ app.get('/api/download-status/:downloadId', (req, res) => {
   res.status(404).json({ error: 'Download ID not found' });
 });
 
+// Get file endpoint
 app.get('/api/get-file/:downloadId', async (req, res) => {
   const { downloadId } = req.params;
 
@@ -777,24 +764,22 @@ app.get('/api/get-file/:downloadId', async (req, res) => {
   }
 });
 
-// Direct download endpoint (updated with improved error handling)
+// Direct download endpoint
 app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
   const { videoId, formatId } = req.params;
   const { filename } = req.query;
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-      try {
+  try {
     if (!ytdl.validateURL(url)) {
       return res.status(400).json({ error: 'Invalid video ID' });
     }
 
-    // Add delay to avoid rate limiting
     await new Promise(resolve => setTimeout(resolve, 2000 + Math.random() * 3000));
 
     const agents = createYtdlAgents();
     let info;
     
-    // Try with different agents
     for (const agent of agents) {
       try {
         info = await ytdl.getInfo(url, { 
@@ -817,20 +802,16 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
     
     const videoDetails = info.videoDetails;
     const title = videoDetails.title.replace(/[^\w\s-]/g, '').trim();
-    
     const downloadName = filename || `${title}.mp4`;
 
-    // Find the requested format
     const requestedFormat = info.formats.find(f => f.itag.toString() === formatId);
     
     if (!requestedFormat) {
       return res.status(404).json({ error: 'Format not found' });
     }
 
-    // Use the first working agent
     const workingAgent = agents[0];
 
-    // If format has audio, stream directly
     if (requestedFormat.hasAudio) {
       res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
       res.setHeader('Content-Type', 'video/mp4');
@@ -854,26 +835,22 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
 
       stream.pipe(res);
     } else {
-      // Format doesn't have audio, need to merge with best audio
       const tempId = uuidv4();
       const videoPath = path.join(TEMP_FOLDER, `${tempId}_video.${requestedFormat.container}`);
       const audioPath = path.join(TEMP_FOLDER, `${tempId}_audio.webm`);
 
       try {
-        // Get best audio format
         const audioFormat = ytdl.chooseFormat(info.formats, { quality: 'highestaudio' });
         
         if (!audioFormat) {
           return res.status(500).json({ error: 'No audio format available' });
         }
 
-        // Download video and audio
         await Promise.all([
           downloadToFile(url, requestedFormat, videoPath, workingAgent),
           downloadToFile(url, audioFormat, audioPath, workingAgent)
         ]);
 
-        // Merge and stream the result
         res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
         res.setHeader('Content-Type', 'video/mp4');
 
@@ -888,13 +865,11 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
           ])
           .format('mp4')
           .on('end', () => {
-            // Clean up temp files
             fs.unlink(videoPath).catch(console.error);
             fs.unlink(audioPath).catch(console.error);
           })
           .on('error', (err) => {
             console.error('FFmpeg error:', err);
-            // Clean up temp files
             fs.unlink(videoPath).catch(console.error);
             fs.unlink(audioPath).catch(console.error);
             if (!res.headersSent) {
@@ -905,7 +880,6 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
         ffmpegProcess.pipe(res);
 
       } catch (error) {
-        // Clean up any temp files
         fs.unlink(videoPath).catch(console.error);
         fs.unlink(audioPath).catch(console.error);
         throw error;
@@ -915,7 +889,6 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
   } catch (error) {
     console.error('Direct download error:', error);
     if (!res.headersSent) {
-      // Provide more specific error messages
       let errorMessage = error.message;
       if (error.message.includes('429')) {
         errorMessage = 'YouTube is currently rate limiting requests. Please try again in a few minutes.';
@@ -928,7 +901,7 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
   }
 });
 
-// Helper function to download stream to file (updated)
+// Helper function to download stream to file
 const downloadToFile = (url, format, outputPath, agent) => {
   return new Promise((resolve, reject) => {
     const stream = ytdl(url, { 
@@ -976,7 +949,7 @@ const startServer = async () => {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`YouTube Downloader API running on port ${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/api/health`);
-    console.log(`Proxy enabled: ${!!SCRAPERAPI_KEY}`);
+    console.log(`SOCKS5 Proxy: ${PROXY_HOST}:${PROXY_PORT}`);
     console.log(`YTDL_NO_UPDATE set to disable update checks`);
     console.log(`Request queue system active`);
     console.log(`Rate limiting: ${REQUEST_DELAY}ms between requests`);

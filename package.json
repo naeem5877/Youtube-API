@@ -1,19 +1,28 @@
 {
-  "name": "nodejs",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "youtube-downloader-api",
+  "version": "2.0.0",
+  "description": "Simplified YouTube video streaming API with direct URL access",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
-  "keywords": [],
-  "author": "Naeem Ahmed",
-  "license": "ISC",
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",
-    "@types/node": "^22.13.11",
     "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "ytdl-core": "^4.11.5"
-  }
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "youtube",
+    "downloader",
+    "streaming",
+    "api",
+    "video",
+    "audio"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
 }

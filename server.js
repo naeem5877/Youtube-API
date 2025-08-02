@@ -31,35 +31,58 @@ const getVideoInfo = async (url) => {
     const videoDetails = info.videoDetails;
     const formats = info.formats;
 
-    // Filter and map audio formats
+    // Filter and map audio formats (MP4 only)
     const audioFormats = formats
-      .filter(format => format.hasAudio && !format.hasVideo && format.audioBitrate)
-      .map(format => ({
-        format_id: format.itag.toString(),
-        ext: format.container,
-        format_note: `${format.audioBitrate}kbps`,
-        abr: format.audioBitrate,
-        filesize: format.contentLength ? parseInt(format.contentLength) : null,
-        download_url: `/api/stream/${videoDetails.videoId}/${format.itag}`
-      }))
+      .filter(format => 
+        format.hasAudio && 
+        !format.hasVideo && 
+        format.audioBitrate &&
+        (format.container === 'mp4' || format.mimeType?.includes('mp4'))
+      )
+      .reduce((unique, format) => {
+        // Remove duplicates by format_id
+        const exists = unique.find(f => f.format_id === format.itag.toString());
+        if (!exists) {
+          unique.push({
+            format_id: format.itag.toString(),
+            ext: 'mp4',
+            format_note: `${format.audioBitrate}kbps`,
+            abr: format.audioBitrate,
+            filesize: format.contentLength ? parseInt(format.contentLength) : null,
+            direct_url: format.url
+          });
+        }
+        return unique;
+      }, [])
       .sort((a, b) => (b.abr || 0) - (a.abr || 0));
 
-    // Filter and map video formats
+    // Filter and map video formats (MP4 only)
     const videoFormats = formats
-      .filter(format => format.hasVideo && format.height)
-      .map(format => ({
-        format_id: format.itag.toString(),
-        ext: format.container,
-        format_note: format.qualityLabel || `${format.height}p`,
-        width: format.width,
-        height: format.height,
-        fps: format.fps,
-        vcodec: format.videoCodec,
-        acodec: format.hasAudio ? format.audioCodec : 'none',
-        filesize: format.contentLength ? parseInt(format.contentLength) : null,
-        download_url: `/api/stream/${videoDetails.videoId}/${format.itag}`,
-        resolution: `${format.width}x${format.height}`
-      }))
+      .filter(format => 
+        format.hasVideo && 
+        format.height &&
+        (format.container === 'mp4' || format.mimeType?.includes('mp4'))
+      )
+      .reduce((unique, format) => {
+        // Remove duplicates by format_id
+        const exists = unique.find(f => f.format_id === format.itag.toString());
+        if (!exists) {
+          unique.push({
+            format_id: format.itag.toString(),
+            ext: 'mp4',
+            format_note: format.qualityLabel || `${format.height}p`,
+            width: format.width,
+            height: format.height,
+            fps: format.fps,
+            vcodec: format.videoCodec,
+            acodec: format.hasAudio ? format.audioCodec : 'none',
+            filesize: format.contentLength ? parseInt(format.contentLength) : null,
+            direct_url: format.url,
+            resolution: `${format.width}x${format.height}`
+          });
+        }
+        return unique;
+      }, [])
       .sort((a, b) => (b.height || 0) - (a.height || 0));
 
     return {
@@ -201,34 +224,56 @@ app.get('/api/get-urls/:videoId', async (req, res) => {
     const info = await ytdl.getInfo(url, { agent });
     const formats = info.formats;
 
-    // Get direct URLs for all formats
+    // Get direct URLs for MP4 audio formats only
     const audioUrls = formats
-      .filter(format => format.hasAudio && !format.hasVideo && format.audioBitrate)
-      .map(format => ({
-        format_id: format.itag.toString(),
-        ext: format.container,
-        format_note: `${format.audioBitrate}kbps`,
-        abr: format.audioBitrate,
-        filesize: format.contentLength ? parseInt(format.contentLength) : null,
-        direct_url: format.url
-      }))
+      .filter(format => 
+        format.hasAudio && 
+        !format.hasVideo && 
+        format.audioBitrate &&
+        (format.container === 'mp4' || format.mimeType?.includes('mp4'))
+      )
+      .reduce((unique, format) => {
+        const exists = unique.find(f => f.format_id === format.itag.toString());
+        if (!exists) {
+          unique.push({
+            format_id: format.itag.toString(),
+            ext: 'mp4',
+            format_note: `${format.audioBitrate}kbps`,
+            abr: format.audioBitrate,
+            filesize: format.contentLength ? parseInt(format.contentLength) : null,
+            direct_url: format.url
+          });
+        }
+        return unique;
+      }, [])
       .sort((a, b) => (b.abr || 0) - (a.abr || 0));
 
+    // Get direct URLs for MP4 video formats only
     const videoUrls = formats
-      .filter(format => format.hasVideo && format.height)
-      .map(format => ({
-        format_id: format.itag.toString(),
-        ext: format.container,
-        format_note: format.qualityLabel || `${format.height}p`,
-        width: format.width,
-        height: format.height,
-        fps: format.fps,
-        vcodec: format.videoCodec,
-        acodec: format.hasAudio ? format.audioCodec : 'none',
-        filesize: format.contentLength ? parseInt(format.contentLength) : null,
-        direct_url: format.url,
-        resolution: `${format.width}x${format.height}`
-      }))
+      .filter(format => 
+        format.hasVideo && 
+        format.height &&
+        (format.container === 'mp4' || format.mimeType?.includes('mp4'))
+      )
+      .reduce((unique, format) => {
+        const exists = unique.find(f => f.format_id === format.itag.toString());
+        if (!exists) {
+          unique.push({
+            format_id: format.itag.toString(),
+            ext: 'mp4',
+            format_note: format.qualityLabel || `${format.height}p`,
+            width: format.width,
+            height: format.height,
+            fps: format.fps,
+            vcodec: format.videoCodec,
+            acodec: format.hasAudio ? format.audioCodec : 'none',
+            filesize: format.contentLength ? parseInt(format.contentLength) : null,
+            direct_url: format.url,
+            resolution: `${format.width}x${format.height}`
+          });
+        }
+        return unique;
+      }, [])
       .sort((a, b) => (b.height || 0) - (a.height || 0));
 
     res.json({
@@ -237,7 +282,7 @@ app.get('/api/get-urls/:videoId', async (req, res) => {
       audio_urls: audioUrls,
       video_urls: videoUrls,
       expires_in: '6 hours',
-      note: 'Direct URLs expire after some time. Use immediately or refresh to get new URLs.'
+      note: 'Direct YouTube URLs expire after some time. Use immediately or refresh to get new URLs.'
     });
 
   } catch (error) {

@@ -17,98 +17,148 @@ app.use(cors({
   ]
 }));
 
-// Create agent with better headers to avoid detection
-const agent = ytdl.createAgent([], {
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  }
+// Create agent with randomized headers to avoid detection
+const getRandomUserAgent = () => {
+  const userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0'
+  ];
+  return userAgents[Math.floor(Math.random() * userAgents.length)];
+};
+
+const getRandomHeaders = () => ({
+  'User-Agent': getRandomUserAgent(),
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'DNT': '1',
+  'Connection': 'keep-alive',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Cache-Control': 'max-age=0'
 });
 
-// Helper function to get video info
-const getVideoInfo = async (url) => {
-  try {
-    const info = await ytdl.getInfo(url, { agent });
-    const videoDetails = info.videoDetails;
-    const formats = info.formats;
+const createAgent = () => {
+  return ytdl.createAgent([], {
+    headers: getRandomHeaders()
+  });
+};
 
-    // Filter and map audio formats (MP4 only)
-    const audioFormats = formats
-      .filter(format => 
-        format.hasAudio && 
-        !format.hasVideo && 
-        format.audioBitrate &&
-        (format.container === 'mp4' || format.mimeType?.includes('mp4'))
-      )
-      .reduce((unique, format) => {
-        // Remove duplicates by format_id
-        const exists = unique.find(f => f.format_id === format.itag.toString());
-        if (!exists) {
-          unique.push({
-            format_id: format.itag.toString(),
-            ext: 'mp4',
-            format_note: `${format.audioBitrate}kbps`,
-            abr: format.audioBitrate,
-            filesize: format.contentLength ? parseInt(format.contentLength) : null,
-            direct_url: format.url
-          });
+// Helper function to get video info with retry mechanism
+const getVideoInfo = async (url, retries = 3) => {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      // Create a new agent for each request to avoid detection
+      const agent = createAgent();
+      
+      // Add random delay between requests
+      if (attempt > 1) {
+        await new Promise(resolve => setTimeout(resolve, Math.random() * 2000 + 1000));
+      }
+
+      const info = await ytdl.getInfo(url, { 
+        agent,
+        requestOptions: {
+          headers: getRandomHeaders()
         }
-        return unique;
-      }, [])
-      .sort((a, b) => (b.abr || 0) - (a.abr || 0));
+      });
+      
+      const videoDetails = info.videoDetails;
+      const formats = info.formats;
 
-    // Filter and map video formats (MP4 only)
-    const videoFormats = formats
-      .filter(format => 
-        format.hasVideo && 
-        format.height &&
-        (format.container === 'mp4' || format.mimeType?.includes('mp4'))
-      )
-      .reduce((unique, format) => {
-        // Remove duplicates by format_id
-        const exists = unique.find(f => f.format_id === format.itag.toString());
-        if (!exists) {
-          unique.push({
-            format_id: format.itag.toString(),
-            ext: 'mp4',
-            format_note: format.qualityLabel || `${format.height}p`,
-            width: format.width,
-            height: format.height,
-            fps: format.fps,
-            vcodec: format.videoCodec,
-            acodec: format.hasAudio ? format.audioCodec : 'none',
-            filesize: format.contentLength ? parseInt(format.contentLength) : null,
-            direct_url: format.url,
-            resolution: `${format.width}x${format.height}`
-          });
-        }
-        return unique;
-      }, [])
-      .sort((a, b) => (b.height || 0) - (a.height || 0));
+      // Filter and map audio formats (MP4 only)
+      const audioFormats = formats
+        .filter(format => 
+          format.hasAudio && 
+          !format.hasVideo && 
+          format.audioBitrate &&
+          (format.container === 'mp4' || format.mimeType?.includes('mp4'))
+        )
+        .reduce((unique, format) => {
+          // Remove duplicates by format_id
+          const exists = unique.find(f => f.format_id === format.itag.toString());
+          if (!exists) {
+            unique.push({
+              format_id: format.itag.toString(),
+              ext: 'mp4',
+              format_note: `${format.audioBitrate}kbps`,
+              abr: format.audioBitrate,
+              filesize: format.contentLength ? parseInt(format.contentLength) : null,
+              direct_url: format.url
+            });
+          }
+          return unique;
+        }, [])
+        .sort((a, b) => (b.abr || 0) - (a.abr || 0));
 
-    return {
-      id: videoDetails.videoId,
-      title: videoDetails.title,
-      description: videoDetails.description,
-      duration: parseInt(videoDetails.lengthSeconds),
-      view_count: parseInt(videoDetails.viewCount),
-      upload_date: videoDetails.uploadDate,
-      thumbnails: videoDetails.thumbnails.map(thumb => ({
-        url: thumb.url,
-        width: thumb.width,
-        height: thumb.height
-      })),
-      channel: {
-        id: videoDetails.channelId,
-        name: videoDetails.author,
-        url: `https://www.youtube.com/channel/${videoDetails.channelId}`,
-        verified: videoDetails.author?.verified || false
-      },
-      audio_formats: audioFormats,
-      video_formats: videoFormats
-    };
-  } catch (error) {
-    console.error('Video info error:', error);
-    throw new Error(`Failed to get video info: ${error.message}`);
+      // Filter and map video formats (MP4 only)
+      const videoFormats = formats
+        .filter(format => 
+          format.hasVideo && 
+          format.height &&
+          (format.container === 'mp4' || format.mimeType?.includes('mp4'))
+        )
+        .reduce((unique, format) => {
+          // Remove duplicates by format_id
+          const exists = unique.find(f => f.format_id === format.itag.toString());
+          if (!exists) {
+            unique.push({
+              format_id: format.itag.toString(),
+              ext: 'mp4',
+              format_note: format.qualityLabel || `${format.height}p`,
+              width: format.width,
+              height: format.height,
+              fps: format.fps,
+              vcodec: format.videoCodec,
+              acodec: format.hasAudio ? format.audioCodec : 'none',
+              filesize: format.contentLength ? parseInt(format.contentLength) : null,
+              direct_url: format.url,
+              resolution: `${format.width}x${format.height}`
+            });
+          }
+          return unique;
+        }, [])
+        .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+      return {
+        id: videoDetails.videoId,
+        title: videoDetails.title,
+        description: videoDetails.description,
+        duration: parseInt(videoDetails.lengthSeconds),
+        view_count: parseInt(videoDetails.viewCount),
+        upload_date: videoDetails.uploadDate,
+        thumbnails: videoDetails.thumbnails.map(thumb => ({
+          url: thumb.url,
+          width: thumb.width,
+          height: thumb.height
+        })),
+        channel: {
+          id: videoDetails.channelId,
+          name: videoDetails.author,
+          url: `https://www.youtube.com/channel/${videoDetails.channelId}`,
+          verified: videoDetails.author?.verified || false
+        },
+        audio_formats: audioFormats,
+        video_formats: videoFormats
+      };
+    } catch (error) {
+      console.error(`Video info error (attempt ${attempt}):`, error.message);
+      
+      if (attempt === retries) {
+        throw new Error(`Failed to get video info after ${retries} attempts: ${error.message}`);
+      }
+      
+      // If it's a 429 error, wait longer before retry
+      if (error.message.includes('429')) {
+        await new Promise(resolve => setTimeout(resolve, Math.random() * 5000 + 3000));
+      }
+    }
   }
 };
 
@@ -156,13 +206,22 @@ app.get('/api/stream/:videoId/:formatId', async (req, res) => {
       return res.status(400).json({ error: 'Invalid video ID' });
     }
 
-    const info = await ytdl.getInfo(url, { agent });
+    // Create new agent for each request
+    const agent = createAgent();
+    
+    const info = await ytdl.getInfo(url, { 
+      agent,
+      requestOptions: {
+        headers: getRandomHeaders()
+      }
+    });
+    
     const videoDetails = info.videoDetails;
     const title = videoDetails.title.replace(/[^\w\s\-\.]/g, '').trim();
-
+    
     // Find the requested format
     const requestedFormat = info.formats.find(f => f.itag.toString() === formatId);
-
+    
     if (!requestedFormat) {
       return res.status(404).json({ error: 'Format not found' });
     }
@@ -170,7 +229,7 @@ app.get('/api/stream/:videoId/:formatId', async (req, res) => {
     // Determine file extension and content type
     const fileExtension = requestedFormat.container || 'mp4';
     const downloadName = filename || `${title}.${fileExtension}`;
-
+    
     let contentType = 'video/mp4';
     if (requestedFormat.hasAudio && !requestedFormat.hasVideo) {
       contentType = fileExtension === 'webm' ? 'audio/webm' : 'audio/mp4';
@@ -179,15 +238,18 @@ app.get('/api/stream/:videoId/:formatId', async (req, res) => {
     // Set response headers
     res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
     res.setHeader('Content-Type', contentType);
-
+    
     if (requestedFormat.contentLength) {
       res.setHeader('Content-Length', requestedFormat.contentLength);
     }
 
-    // Create and pipe the stream
+    // Create and pipe the stream with new agent
     const stream = ytdl(url, { 
       format: requestedFormat,
-      agent
+      agent,
+      requestOptions: {
+        headers: getRandomHeaders()
+      }
     });
 
     stream.on('error', (error) => {
@@ -221,7 +283,16 @@ app.get('/api/get-urls/:videoId', async (req, res) => {
       return res.status(400).json({ error: 'Invalid video ID' });
     }
 
-    const info = await ytdl.getInfo(url, { agent });
+    // Create new agent for each request
+    const agent = createAgent();
+    
+    const info = await ytdl.getInfo(url, { 
+      agent,
+      requestOptions: {
+        headers: getRandomHeaders()
+      }
+    });
+    
     const formats = info.formats;
 
     // Get direct URLs for MP4 audio formats only

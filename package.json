@@ -6,12 +6,13 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["youtube video downloader"],
+  "keywords": [],
   "author": "Naeem Ahmed",
   "license": "ISC",
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",
     "@types/node": "^22.13.11",
+    "cors": "^2.8.5",
     "express": "^5.1.0",
     "ytdl-core": "^4.11.5"
   }

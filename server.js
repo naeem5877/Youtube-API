@@ -1,12 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const ytdl = require('@distube/ytdl-core');
-const fs = require('fs').promises;
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
-const multer = require('multer');
-const ffmpeg = require('fluent-ffmpeg');
-const puppeteer = require('puppeteer');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -23,202 +17,16 @@ app.use(cors({
   ]
 }));
 
-// Configuration
-const DOWNLOAD_FOLDER = path.join(process.cwd(), 'downloads');
-const TEMP_FOLDER = path.join(process.cwd(), 'temp');
-
-// Puppeteer browser instance (shared)
-let browserInstance = null;
-
-// Create directories
-const createDirectories = async () => {
-  try {
-    await fs.mkdir(DOWNLOAD_FOLDER, { recursive: true });
-    await fs.mkdir(TEMP_FOLDER, { recursive: true });
-  } catch (error) {
-    console.error('Error creating directories:', error);
+// Create agent with better headers to avoid detection
+const agent = ytdl.createAgent([], {
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   }
-};
-
-// Initialize Puppeteer browser
-const initBrowser = async () => {
-  try {
-    if (browserInstance && browserInstance.isConnected()) {
-      return browserInstance;
-    }
-
-    browserInstance = await puppeteer.launch({
-      headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding'
-      ],
-      defaultViewport: {
-        width: 1920,
-        height: 1080
-      }
-    });
-
-    console.log('Puppeteer browser initialized');
-    return browserInstance;
-  } catch (error) {
-    console.error('Failed to initialize browser:', error);
-    throw error;
-  }
-};
-
-// Get cookies from YouTube using Puppeteer
-const getYouTubeCookies = async () => {
-  try {
-    const browser = await initBrowser();
-    const page = await browser.newPage();
-
-    // Set user agent to mimic real browser
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-
-    // Set additional headers
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-    });
-
-    // Navigate to YouTube
-    await page.goto('https://www.youtube.com', {
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
-
-    // Wait a bit for the page to fully load
-    await page.waitForTimeout(3000);
-
-    // Get cookies
-    const cookies = await page.cookies();
-    await page.close();
-
-    return cookies;
-  } catch (error) {
-    console.error('Error getting YouTube cookies:', error);
-    return [];
-  }
-};
-
-// Create ytdl agent with Puppeteer cookies
-const createYtdlAgent = async () => {
-  try {
-    const cookies = await getYouTubeCookies();
-
-    // Convert Puppeteer cookies to ytdl format
-    const ytdlCookies = cookies.map(cookie => ({
-      name: cookie.name,
-      value: cookie.value,
-      domain: cookie.domain,
-      path: cookie.path,
-      secure: cookie.secure,
-      httpOnly: cookie.httpOnly
-    }));
-
-    const agent = ytdl.createAgent(ytdlCookies, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-      }
-    });
-
-    console.log(`Created ytdl agent with ${ytdlCookies.length} cookies`);
-    return agent;
-  } catch (error) {
-    console.error('Error creating ytdl agent:', error);
-    // Fallback to basic agent
-    return ytdl.createAgent([], {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
-    });
-  }
-};
-
-// Cache for the ytdl agent (refresh every 30 minutes)
-let cachedAgent = null;
-let agentCacheTime = 0;
-const AGENT_CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
-
-const getAgent = async () => {
-  const now = Date.now();
-  if (!cachedAgent || (now - agentCacheTime) > AGENT_CACHE_DURATION) {
-    console.log('Refreshing ytdl agent...');
-    cachedAgent = await createYtdlAgent();
-    agentCacheTime = now;
-  }
-  return cachedAgent;
-};
-
-// Storage for download progress and completed downloads
-const downloadsInProgress = new Map();
-const completedDownloads = new Map();
-
-// Cleanup function
-const cleanupOldFiles = async () => {
-  const now = Date.now();
-  const twoHours = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
-
-  try {
-    // Clean download folder
-    const downloadFiles = await fs.readdir(DOWNLOAD_FOLDER);
-    for (const file of downloadFiles) {
-      const filePath = path.join(DOWNLOAD_FOLDER, file);
-      const stats = await fs.stat(filePath);
-      if (now - stats.mtime.getTime() > twoHours) {
-        await fs.unlink(filePath);
-        console.log(`Deleted old file: ${file}`);
-      }
-    }
-
-    // Clean temp folder
-    const tempFiles = await fs.readdir(TEMP_FOLDER);
-    for (const file of tempFiles) {
-      const filePath = path.join(TEMP_FOLDER, file);
-      const stats = await fs.stat(filePath);
-      if (now - stats.mtime.getTime() > twoHours) {
-        await fs.unlink(filePath);
-      }
-    }
-
-    // Clean completed downloads map
-    for (const [id, info] of completedDownloads.entries()) {
-      if (now - info.completionTime > twoHours) {
-        completedDownloads.delete(id);
-      }
-    }
-  } catch (error) {
-    console.error('Cleanup error:', error);
-  }
-};
-
-// Run cleanup every hour
-setInterval(cleanupOldFiles, 60 * 60 * 1000);
+});
 
 // Helper function to get video info
 const getVideoInfo = async (url) => {
   try {
-    const agent = await getAgent();
     const info = await ytdl.getInfo(url, { agent });
     const videoDetails = info.videoDetails;
     const formats = info.formats;
@@ -232,7 +40,7 @@ const getVideoInfo = async (url) => {
         format_note: `${format.audioBitrate}kbps`,
         abr: format.audioBitrate,
         filesize: format.contentLength ? parseInt(format.contentLength) : null,
-        download_url: `/api/direct-download/${videoDetails.videoId}/${format.itag}`
+        download_url: `/api/stream/${videoDetails.videoId}/${format.itag}`
       }))
       .sort((a, b) => (b.abr || 0) - (a.abr || 0));
 
@@ -249,7 +57,7 @@ const getVideoInfo = async (url) => {
         vcodec: format.videoCodec,
         acodec: format.hasAudio ? format.audioCodec : 'none',
         filesize: format.contentLength ? parseInt(format.contentLength) : null,
-        download_url: `/api/direct-download/${videoDetails.videoId}/${format.itag}`,
+        download_url: `/api/stream/${videoDetails.videoId}/${format.itag}`,
         resolution: `${format.width}x${format.height}`
       }))
       .sort((a, b) => (b.height || 0) - (a.height || 0));
@@ -284,19 +92,13 @@ const getVideoInfo = async (url) => {
 // Routes
 
 // Health check
-app.get('/api/health', async (req, res) => {
-  try {
-    const browserConnected = browserInstance && browserInstance.isConnected();
-    res.json({
-      status: 'ok',
-      version: '2.0.0',
-      browserConnected,
-      platform: 'nodejs',
-      puppeteer: true
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    version: '3.0.0',
+    platform: 'nodejs',
+    features: 'direct_streaming_only'
+  });
 });
 
 // Get video information
@@ -315,274 +117,13 @@ app.get('/api/video-info', async (req, res) => {
     const videoInfo = await getVideoInfo(url);
     res.json(videoInfo);
   } catch (error) {
+    console.error('Get video info error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Start download
-app.get('/api/download', async (req, res) => {
-  const { url, format_id } = req.query;
-
-  if (!url) {
-    return res.status(400).json({ error: 'Missing video URL' });
-  }
-
-  if (!ytdl.validateURL(url)) {
-    return res.status(400).json({ error: 'Invalid YouTube URL' });
-  }
-
-  const downloadId = uuidv4();
-
-  // Start download in background
-  processDownload(downloadId, url, format_id);
-
-  res.json({
-    downloadId,
-    status: 'processing',
-    message: 'Download started. Check status using the /api/download-status endpoint.'
-  });
-});
-
-// Process download function
-const processDownload = async (downloadId, url, formatId) => {
-  downloadsInProgress.set(downloadId, {
-    status: 'downloading',
-    progress: 0,
-    url,
-    startTime: Date.now()
-  });
-
-  try {
-    const agent = await getAgent();
-    const info = await ytdl.getInfo(url, { agent });
-    const videoDetails = info.videoDetails;
-    const title = videoDetails.title.replace(/[^\w\s-]/g, '').trim();
-    const outputPath = path.join(DOWNLOAD_FOLDER, `${downloadId}_${title}.mp4`);
-
-    // Get best video and audio formats
-    const videoFormat = formatId ? 
-      info.formats.find(f => f.itag.toString() === formatId) :
-      ytdl.chooseFormat(info.formats, { quality: 'highestvideo' });
-
-    const audioFormat = ytdl.chooseFormat(info.formats, { quality: 'highestaudio' });
-
-    if (!videoFormat || !audioFormat) {
-      throw new Error('Could not find suitable video or audio format');
-    }
-
-    // If video format has audio, just download it directly
-    if (videoFormat.hasAudio) {
-      const stream = ytdl(url, { format: videoFormat, agent });
-      const writeStream = require('fs').createWriteStream(outputPath);
-
-      let downloadedBytes = 0;
-      const totalBytes = parseInt(videoFormat.contentLength) || 0;
-
-      stream.on('data', (chunk) => {
-        downloadedBytes += chunk.length;
-        if (totalBytes > 0) {
-          const progress = Math.round((downloadedBytes / totalBytes) * 100);
-          const downloadInfo = downloadsInProgress.get(downloadId);
-          if (downloadInfo) {
-            downloadInfo.progress = progress;
-          }
-        }
-      });
-
-      stream.on('error', (error) => {
-        console.error('Download error:', error);
-        downloadsInProgress.delete(downloadId);
-        completedDownloads.set(downloadId, {
-          status: 'failed',
-          url,
-          error: error.message,
-          completionTime: Date.now()
-        });
-      });
-
-      stream.pipe(writeStream);
-
-      writeStream.on('finish', () => {
-        downloadsInProgress.delete(downloadId);
-        completedDownloads.set(downloadId, {
-          status: 'completed',
-          url,
-          filePath: outputPath,
-          downloadUrl: `/api/get-file/${downloadId}`,
-          completionTime: Date.now()
-        });
-      });
-    } else {
-      // Download video and audio separately, then merge
-      const videoPath = path.join(TEMP_FOLDER, `${downloadId}_video.${videoFormat.container}`);
-      const audioPath = path.join(TEMP_FOLDER, `${downloadId}_audio.${audioFormat.container}`);
-
-      // Update status
-      const downloadInfo = downloadsInProgress.get(downloadId);
-      if (downloadInfo) downloadInfo.status = 'downloading_video';
-
-      // Download video
-      await downloadStream(url, videoFormat, videoPath, downloadId, 'video');
-
-      // Update status
-      if (downloadsInProgress.has(downloadId)) {
-        downloadsInProgress.get(downloadId).status = 'downloading_audio';
-      }
-
-      // Download audio
-      await downloadStream(url, audioFormat, audioPath, downloadId, 'audio');
-
-      // Update status
-      if (downloadsInProgress.has(downloadId)) {
-        downloadsInProgress.get(downloadId).status = 'merging';
-        downloadsInProgress.get(downloadId).progress = 90;
-      }
-
-      // Merge video and audio
-      await mergeVideoAudio(videoPath, audioPath, outputPath);
-
-      // Clean up temp files
-      try {
-        await fs.unlink(videoPath);
-        await fs.unlink(audioPath);
-      } catch (err) {
-        console.error('Error cleaning temp files:', err);
-      }
-
-      downloadsInProgress.delete(downloadId);
-      completedDownloads.set(downloadId, {
-        status: 'completed',
-        url,
-        filePath: outputPath,
-        downloadUrl: `/api/get-file/${downloadId}`,
-        completionTime: Date.now()
-      });
-    }
-
-  } catch (error) {
-    console.error('Process download error:', error);
-    downloadsInProgress.delete(downloadId);
-    completedDownloads.set(downloadId, {
-      status: 'failed',
-      url,
-      error: error.message,
-      completionTime: Date.now()
-    });
-  }
-};
-
-// Helper function to download stream to file
-const downloadStream = (url, format, outputPath, downloadId, type) => {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const agent = await getAgent();
-      const stream = ytdl(url, { format, agent });
-      const writeStream = require('fs').createWriteStream(outputPath);
-
-      let downloadedBytes = 0;
-      const totalBytes = parseInt(format.contentLength) || 0;
-
-      stream.on('data', (chunk) => {
-        downloadedBytes += chunk.length;
-        if (totalBytes > 0 && downloadsInProgress.has(downloadId)) {
-          const progress = Math.round((downloadedBytes / totalBytes) * (type === 'video' ? 40 : 80));
-          const downloadInfo = downloadsInProgress.get(downloadId);
-          if (downloadInfo) {
-            downloadInfo.progress = Math.min(progress + (type === 'audio' ? 40 : 0), 85);
-          }
-        }
-      });
-
-      stream.on('error', reject);
-      stream.pipe(writeStream);
-
-      writeStream.on('finish', resolve);
-      writeStream.on('error', reject);
-    } catch (error) {
-      reject(error);
-    }
-  });
-};
-
-// Helper function to merge video and audio using ffmpeg
-const mergeVideoAudio = (videoPath, audioPath, outputPath) => {
-  return new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(videoPath)
-      .input(audioPath)
-      .outputOptions([
-        '-c:v copy',  // Copy video codec (no re-encoding)
-        '-c:a aac',   // Convert audio to AAC
-        '-strict experimental'
-      ])
-      .output(outputPath)
-      .on('end', () => {
-        console.log('Merging finished successfully');
-        resolve();
-      })
-      .on('error', (err) => {
-        console.error('Error during merging:', err);
-        reject(err);
-      })
-      .run();
-  });
-};
-
-// Check download status
-app.get('/api/download-status/:downloadId', (req, res) => {
-  const { downloadId } = req.params;
-
-  // Check if download is in progress
-  if (downloadsInProgress.has(downloadId)) {
-    const info = downloadsInProgress.get(downloadId);
-    return res.json({
-      downloadId,
-      status: info.status,
-      progress: info.progress,
-      url: info.url
-    });
-  }
-
-  // Check if download is completed
-  if (completedDownloads.has(downloadId)) {
-    const info = completedDownloads.get(downloadId);
-    return res.json({
-      downloadId,
-      status: info.status,
-      url: info.url,
-      downloadUrl: info.downloadUrl,
-      error: info.error
-    });
-  }
-
-  res.status(404).json({ error: 'Download ID not found' });
-});
-
-// Get downloaded file
-app.get('/api/get-file/:downloadId', async (req, res) => {
-  const { downloadId } = req.params;
-
-  if (!completedDownloads.has(downloadId)) {
-    return res.status(404).json({ error: 'Download not found' });
-  }
-
-  const downloadInfo = completedDownloads.get(downloadId);
-
-  if (downloadInfo.status !== 'completed') {
-    return res.status(404).json({ error: 'Download not completed' });
-  }
-
-  try {
-    await fs.access(downloadInfo.filePath);
-    const filename = path.basename(downloadInfo.filePath);
-    res.download(downloadInfo.filePath, filename);
-  } catch (error) {
-    res.status(404).json({ error: 'File not found' });
-  }
-});
-
-// Direct download endpoint with audio merging
-app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
+// Direct stream endpoint
+app.get('/api/stream/:videoId/:formatId', async (req, res) => {
   const { videoId, formatId } = req.params;
   const { filename } = req.query;
   const url = `https://www.youtube.com/watch?v=${videoId}`;
@@ -592,12 +133,9 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
       return res.status(400).json({ error: 'Invalid video ID' });
     }
 
-    const agent = await getAgent();
     const info = await ytdl.getInfo(url, { agent });
     const videoDetails = info.videoDetails;
-    const title = videoDetails.title.replace(/[^\w\s-]/g, '').trim();
-
-    const downloadName = filename || `${title}.mp4`;
+    const title = videoDetails.title.replace(/[^\w\s\-\.]/g, '').trim();
 
     // Find the requested format
     const requestedFormat = info.formats.find(f => f.itag.toString() === formatId);
@@ -606,138 +144,104 @@ app.get('/api/direct-download/:videoId/:formatId', async (req, res) => {
       return res.status(404).json({ error: 'Format not found' });
     }
 
-    // If format has audio, stream directly
-    if (requestedFormat.hasAudio) {
-      res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
-      res.setHeader('Content-Type', 'video/mp4');
+    // Determine file extension and content type
+    const fileExtension = requestedFormat.container || 'mp4';
+    const downloadName = filename || `${title}.${fileExtension}`;
 
-      const stream = ytdl(url, { 
-        format: requestedFormat,
-        agent
-      });
-
-      stream.on('error', (error) => {
-        console.error('Stream error:', error);
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Download failed' });
-        }
-      });
-
-      stream.pipe(res);
-    } else {
-      // Format doesn't have audio, need to merge with best audio
-      const tempId = uuidv4();
-      const videoPath = path.join(TEMP_FOLDER, `${tempId}_video.${requestedFormat.container}`);
-      const audioPath = path.join(TEMP_FOLDER, `${tempId}_audio.webm`);
-      const outputPath = path.join(TEMP_FOLDER, `${tempId}_merged.mp4`);
-
-      try {
-        // Get best audio format
-        const audioFormat = ytdl.chooseFormat(info.formats, { quality: 'highestaudio' });
-
-        if (!audioFormat) {
-          return res.status(500).json({ error: 'No audio format available' });
-        }
-
-        // Download video and audio
-        await Promise.all([
-          downloadToFile(url, requestedFormat, videoPath),
-          downloadToFile(url, audioFormat, audioPath)
-        ]);
-
-        // Merge and stream the result
-        await new Promise((resolve, reject) => {
-          res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
-          res.setHeader('Content-Type', 'video/mp4');
-
-          ffmpeg()
-            .input(videoPath)
-            .input(audioPath)
-            .outputOptions([
-              '-c:v copy',
-              '-c:a aac',
-              '-strict experimental',
-              '-movflags frag_keyframe+empty_moov' // Enable streaming
-            ])
-            .format('mp4')
-            .on('end', () => {
-              // Clean up temp files
-              fs.unlink(videoPath).catch(console.error);
-              fs.unlink(audioPath).catch(console.error);
-              fs.unlink(outputPath).catch(console.error);
-              resolve();
-            })
-            .on('error', (err) => {
-              console.error('FFmpeg error:', err);
-              // Clean up temp files
-              fs.unlink(videoPath).catch(console.error);
-              fs.unlink(audioPath).catch(console.error);
-              fs.unlink(outputPath).catch(console.error);
-              reject(err);
-            })
-            .pipe(res);
-        });
-
-      } catch (error) {
-        // Clean up any temp files
-        fs.unlink(videoPath).catch(console.error);
-        fs.unlink(audioPath).catch(console.error);
-        fs.unlink(outputPath).catch(console.error);
-        throw error;
-      }
+    let contentType = 'video/mp4';
+    if (requestedFormat.hasAudio && !requestedFormat.hasVideo) {
+      contentType = fileExtension === 'webm' ? 'audio/webm' : 'audio/mp4';
     }
 
+    // Set response headers
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    res.setHeader('Content-Type', contentType);
+
+    if (requestedFormat.contentLength) {
+      res.setHeader('Content-Length', requestedFormat.contentLength);
+    }
+
+    // Create and pipe the stream
+    const stream = ytdl(url, { 
+      format: requestedFormat,
+      agent
+    });
+
+    stream.on('error', (error) => {
+      console.error('Stream error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream failed' });
+      }
+    });
+
+    stream.on('end', () => {
+      console.log(`Stream completed for: ${title}`);
+    });
+
+    stream.pipe(res);
+
   } catch (error) {
-    console.error('Direct download error:', error);
+    console.error('Direct stream error:', error);
     if (!res.headersSent) {
       res.status(500).json({ error: error.message });
     }
   }
 });
 
-// Helper function to download stream to file
-const downloadToFile = async (url, format, outputPath) => {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const agent = await getAgent();
-      const stream = ytdl(url, { format, agent });
-      const writeStream = require('fs').createWriteStream(outputPath);
+// Get direct download URLs (without streaming through server)
+app.get('/api/get-urls/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-      stream.on('error', reject);
-      stream.pipe(writeStream);
-      writeStream.on('finish', resolve);
-      writeStream.on('error', reject);
-    } catch (error) {
-      reject(error);
+  try {
+    if (!ytdl.validateURL(url)) {
+      return res.status(400).json({ error: 'Invalid video ID' });
     }
-  });
-};
 
-// Refresh cookies endpoint (manual trigger)
-app.post('/api/refresh-cookies', async (req, res) => {
-  try {
-    console.log('Manually refreshing cookies...');
-    cachedAgent = await createYtdlAgent();
-    agentCacheTime = Date.now();
-    res.json({ 
-      success: true, 
-      message: 'Cookies refreshed successfully' 
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+    const info = await ytdl.getInfo(url, { agent });
+    const formats = info.formats;
 
-// Browser status endpoint
-app.get('/api/browser-status', async (req, res) => {
-  try {
-    const connected = browserInstance && browserInstance.isConnected();
+    // Get direct URLs for all formats
+    const audioUrls = formats
+      .filter(format => format.hasAudio && !format.hasVideo && format.audioBitrate)
+      .map(format => ({
+        format_id: format.itag.toString(),
+        ext: format.container,
+        format_note: `${format.audioBitrate}kbps`,
+        abr: format.audioBitrate,
+        filesize: format.contentLength ? parseInt(format.contentLength) : null,
+        direct_url: format.url
+      }))
+      .sort((a, b) => (b.abr || 0) - (a.abr || 0));
+
+    const videoUrls = formats
+      .filter(format => format.hasVideo && format.height)
+      .map(format => ({
+        format_id: format.itag.toString(),
+        ext: format.container,
+        format_note: format.qualityLabel || `${format.height}p`,
+        width: format.width,
+        height: format.height,
+        fps: format.fps,
+        vcodec: format.videoCodec,
+        acodec: format.hasAudio ? format.audioCodec : 'none',
+        filesize: format.contentLength ? parseInt(format.contentLength) : null,
+        direct_url: format.url,
+        resolution: `${format.width}x${format.height}`
+      }))
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+
     res.json({
-      connected,
-      lastRefresh: new Date(agentCacheTime).toISOString(),
-      nextRefresh: new Date(agentCacheTime + AGENT_CACHE_DURATION).toISOString()
+      video_id: videoId,
+      title: info.videoDetails.title,
+      audio_urls: audioUrls,
+      video_urls: videoUrls,
+      expires_in: '6 hours',
+      note: 'Direct URLs expire after some time. Use immediately or refresh to get new URLs.'
     });
+
   } catch (error) {
+    console.error('Get URLs error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -748,40 +252,9 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Shutting down gracefully...');
-  if (browserInstance) {
-    await browserInstance.close();
-  }
-  process.exit(0);
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Simplified YouTube API running on port ${PORT}`);
+  console.log(`Health check: http://localhost:${PORT}/api/health`);
+  console.log(`Features: Direct streaming only, no file storage`);
 });
-
-process.on('SIGTERM', async () => {
-  console.log('Shutting down gracefully...');
-  if (browserInstance) {
-    await browserInstance.close();
-  }
-  process.exit(0);
-});
-
-// Initialize directories and start server
-const startServer = async () => {
-  await createDirectories();
-
-  // Initialize browser
-  try {
-    await initBrowser();
-    console.log('Browser initialized successfully');
-  } catch (error) {
-    console.error('Failed to initialize browser:', error);
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`YouTube Downloader API running on port ${PORT}`);
-    console.log(`Health check: http://localhost:${PORT}/api/health`);
-    console.log(`Browser status: http://localhost:${PORT}/api/browser-status`);
-  });
-};
-
-startServer().catch(console.error);

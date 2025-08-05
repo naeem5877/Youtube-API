@@ -1,0 +1,8 @@
+tasks:
+  - init: |
+      npm install
+      sudo apt-get update
+      sudo apt-get install -y ffmpeg
+    command: npm start
+image:
+  file: .gitpod.Dockerfile
